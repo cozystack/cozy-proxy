@@ -13,7 +13,7 @@ There are several ways to achieve this:
 - Adding a secondary interface with Multus.
 - Using native Kubernetes services with externalIPs and exposing them via MetalLB.
 
-The last option is the simplest and most flexible, but it has a limitation: Kubernetes services do not forward all traffic—only traffic on specific ports (see: [Kubernetes Issue #23864](https://github.com/kubernetes/kubernetes/issues/23864)). Additionally, kube-proxy does not perform SNAT, which causes outgoing traffic from the pod to use the node’s default IP.
+The last option is the simplest and most flexible, but it has a limitation: Kubernetes services do not forward all traffic—only traffic on specific ports (see: [Kubernetes Issue #23864](https://github.com/kubernetes/kubernetes/issues/23864)). Additionally, kube-proxy does not perform SNAT, which causes outgoing traffic from the pod to use the 
 
 To address these issues, we have added an additional controller that performs 1:1 NAT for services annotated with `networking.cozystack.io/wholeIP=true`.
 
@@ -23,9 +23,80 @@ cozy-proxy is a simple Kubernetes controller that watches for services with the 
 
 This controller can be used together with kube-proxy and Cilium in kube-proxy replacement mode.
 
+## Installation
+
+Install controller using Helm-chart:
+
+```bash
+helm install cozy-proxy charts/cozy-proxy -n kube-system
+```
+
+## Usage
+
+Create LoadBalancer service with `networking.cozystack.io/wholeIP=true` annotation:
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  annotations:
+    networking.cozystack.io/wholeIP: "true"
+  name: example-service
+spec:
+  allocateLoadBalancerNodePorts: false
+  externalTrafficPolicy: Local
+  ports:
+  - port: 65535 # any
+  selector:
+    app: nginx
+  type: LoadBalancer
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: nginx
+  labels:
+    app: nginx
+spec:
+  containers:
+  - name: nginx
+    image: docker.io/library/nginx:alpine
+```
+
+Check that the service has an external IP:
+
+```bash
+kubectl get svc
+```
+
+example output:
+
+```console
+NAME              TYPE           CLUSTER-IP     EXTERNAL-IP     PORT(S)     AGE
+example-service   LoadBalancer   10.96.195.46   1.2.3.4         65535/TCP   84s
+```
+
+Now try to access serivce using `icmp` and `tcp`, both should work:
+
+```bash
+ping 1.2.3.4
+curl 1.2.3.4
+```
+
+Check external IP from inside the pod:
+
+```bash
+kubectl exec -ti nginx -- curl icanhazip.com
+```
+
+example output whould be the same as the service external IP:
+```console
+1.2.3.4
+```
+
 ## Environment
 
-This controller was developed primarily for the Cozystack platform and has been tested in the following environment:
+This controller was developed primarily for the [Cozystack](https://cozystack.io) platform and has been tested in the following environment:
 - **OS**: Talos Linux
 - **CNI**: Kube-OVN with Cilium in chaining mode.
 - **Kube-proxy**: Cilium in kube-proxy replacement mode.
