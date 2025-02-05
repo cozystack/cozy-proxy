@@ -17,7 +17,7 @@ var log = ctrl.Log.WithName("nft-proxy-processor")
 type NFTProxyProcessor struct {
 	conn *nftables.Conn
 
-	// Table "wholeip" will contain all objects.
+	// Table "cozy_proxy" will contain all objects.
 	table *nftables.Table
 
 	// Sets and maps.
@@ -32,7 +32,7 @@ type NFTProxyProcessor struct {
 	natPrerouting *nftables.Chain // Chain "nat_prerouting": for DNAT rule.
 }
 
-// InitRules initializes the nftables configuration in a single table "wholeip".
+// InitRules initializes the nftables configuration in a single table "cozy_proxy".
 // It flushes the entire ruleset, then re-creates the table with the desired sets, maps, and chains.
 // (If a previous table existed, its set elements are saved and then restored.)
 func (p *NFTProxyProcessor) InitRules() error {
@@ -62,7 +62,7 @@ func (p *NFTProxyProcessor) InitRules() error {
 		}
 	}
 	if existingTable != nil {
-		log.Info("Found existing 'wholeip' table; saving set/map elements")
+		log.Info("Found existing 'cozy_proxy' table; saving set/map elements")
 		// Create dummy set objects for lookup.
 		dummyPod := &nftables.Set{Table: existingTable, Name: "pod", KeyType: nftables.TypeIPAddr}
 		dummySvc := &nftables.Set{Table: existingTable, Name: "svc", KeyType: nftables.TypeIPAddr}
@@ -328,12 +328,10 @@ func (p *NFTProxyProcessor) InitRules() error {
 	return nil
 }
 
-// EnsureRules ensures that the mapping for svcIP and podIP exists.
-// In the pod_svc map (key: pod IP → svc IP) it checks if the given pod already maps to a svc.
-// If the pod is mapped to a different svc, a conflict is detected.
-// In the svc_pod map (key: svc IP → pod IP), if an entry exists with a different pod,
-// the old mapping is overridden.
-// The method also makes sure that the raw sets "pod" and "svc" include the given IPs.
+// EnsureRules ensures that a one-to-one mapping exists between svcIP and podIP.
+// If a mapping already exists for svcIP with a different podIP,
+// the old mapping is removed (from svc_pod, pod_svc, and from the raw pod set)
+// before the new mapping is added.
 func (p *NFTProxyProcessor) EnsureRules(svcIP, podIP string) error {
 	log.Info("Ensuring NAT mapping", "svcIP", svcIP, "podIP", podIP)
 
@@ -346,7 +344,43 @@ func (p *NFTProxyProcessor) EnsureRules(svcIP, podIP string) error {
 		return fmt.Errorf("invalid podIP: %s", podIP)
 	}
 
-	// Check pod_svc map: key=pod IP → value should be svcIP.
+	// --- Remove conflicting mapping for svcIP in svc_pod map ---
+	// If svcIP already maps to a different pod, remove that mapping and
+	// delete the old pod from the raw pod set.
+	svcPodElems, err := p.conn.GetSetElements(p.svcPodMap)
+	if err != nil {
+		log.Error(err, "Failed to get svc_pod map elements")
+		return fmt.Errorf("failed to get svc_pod map elements: %v", err)
+	}
+	for _, el := range svcPodElems {
+		if bytes.Equal(el.Key, parsedSvcIP) {
+			// Found an existing mapping for svcIP.
+			if !bytes.Equal(el.Val, parsedPodIP) {
+				oldPodIP := el.Val
+				log.Info("Updating mapping for svc", "svcIP", svcIP, "oldPodIP", net.IP(oldPodIP).String(), "newPodIP", podIP)
+				// Remove the old mapping from svc_pod.
+				if err := p.conn.SetDeleteElements(p.svcPodMap, []nftables.SetElement{{Key: parsedSvcIP, Val: oldPodIP}}); err != nil {
+					log.Error(err, "Failed to delete old svc_pod mapping", "svcIP", svcIP, "oldPodIP", net.IP(oldPodIP).String())
+					return fmt.Errorf("failed to delete old svc_pod mapping: %v", err)
+				}
+				// Remove the corresponding mapping from pod_svc.
+				if err := p.conn.SetDeleteElements(p.podSvcMap, []nftables.SetElement{{Key: oldPodIP, Val: parsedSvcIP}}); err != nil {
+					log.Error(err, "Failed to delete corresponding pod_svc mapping", "oldPodIP", net.IP(oldPodIP).String(), "svcIP", svcIP)
+					return fmt.Errorf("failed to delete corresponding pod_svc mapping: %v", err)
+				}
+				// Remove the old pod IP from the raw pod set.
+				if err := p.conn.SetDeleteElements(p.podSet, []nftables.SetElement{{Key: oldPodIP}}); err != nil {
+					log.Error(err, "Failed to delete old pod IP from raw pod set", "oldPodIP", net.IP(oldPodIP).String())
+					return fmt.Errorf("failed to delete old pod IP from raw pod set: %v", err)
+				}
+			}
+			break // svcIP mapping handled; exit loop.
+		}
+	}
+
+	// --- Remove conflicting mapping for podIP in pod_svc map ---
+	// If podIP already maps to a different svc, remove that mapping and delete the podIP
+	// from the raw pod set (since the old mapping is no longer desired).
 	podSvcElems, err := p.conn.GetSetElements(p.podSvcMap)
 	if err != nil {
 		log.Error(err, "Failed to get pod_svc map elements")
@@ -354,75 +388,53 @@ func (p *NFTProxyProcessor) EnsureRules(svcIP, podIP string) error {
 	}
 	for _, el := range podSvcElems {
 		if bytes.Equal(el.Key, parsedPodIP) {
+			// Found an existing mapping for podIP.
 			if !bytes.Equal(el.Val, parsedSvcIP) {
-				log.Error(nil, "Mapping conflict in pod_svc: podIP already mapped to a different svcIP",
-					"podIP", podIP, "existingSvcIP", net.IP(el.Val).String())
-				return fmt.Errorf("conflict: podIP %s already mapped to a different svcIP", podIP)
+				log.Info("Updating mapping for pod", "podIP", podIP, "oldSvcIP", net.IP(el.Val).String(), "newSvcIP", svcIP)
+				// Remove the old mapping from pod_svc.
+				if err := p.conn.SetDeleteElements(p.podSvcMap, []nftables.SetElement{{Key: parsedPodIP, Val: el.Val}}); err != nil {
+					log.Error(err, "Failed to delete old pod_svc mapping", "podIP", podIP, "oldSvcIP", net.IP(el.Val).String())
+					return fmt.Errorf("failed to delete old pod_svc mapping: %v", err)
+				}
+				// Remove the corresponding mapping from svc_pod.
+				if err := p.conn.SetDeleteElements(p.svcPodMap, []nftables.SetElement{{Key: el.Val, Val: parsedPodIP}}); err != nil {
+					log.Error(err, "Failed to delete corresponding svc_pod mapping", "oldSvcIP", net.IP(el.Val).String(), "podIP", podIP)
+					return fmt.Errorf("failed to delete corresponding svc_pod mapping: %v", err)
+				}
+				// Remove the old pod IP from the raw pod set.
+				if err := p.conn.SetDeleteElements(p.podSet, []nftables.SetElement{{Key: parsedPodIP}}); err != nil {
+					log.Error(err, "Failed to delete outdated pod IP from raw pod set", "podIP", podIP)
+					return fmt.Errorf("failed to delete outdated pod IP from raw pod set: %v", err)
+				}
 			}
-			// Mapping already exists.
-			goto SvcPodCheck
+			break // podIP mapping handled; exit loop.
 		}
 	}
-	// Add mapping {pod → svc} in pod_svc.
-	if err := p.conn.SetAddElements(p.podSvcMap, []nftables.SetElement{
-		{Key: parsedPodIP, Val: parsedSvcIP},
-	}); err != nil {
+
+	// --- Add the new mapping to both maps ---
+	if err := p.conn.SetAddElements(p.podSvcMap, []nftables.SetElement{{Key: parsedPodIP, Val: parsedSvcIP}}); err != nil {
 		log.Error(err, "Failed to add mapping to pod_svc", "podIP", podIP, "svcIP", svcIP)
 		return fmt.Errorf("failed to add mapping to pod_svc: %v", err)
 	}
-	log.Info("Added mapping to pod_svc", "podIP", podIP, "svcIP", svcIP)
+	if err := p.conn.SetAddElements(p.svcPodMap, []nftables.SetElement{{Key: parsedSvcIP, Val: parsedPodIP}}); err != nil {
+		log.Error(err, "Failed to add mapping to svc_pod", "svcIP", svcIP, "podIP", podIP)
+		return fmt.Errorf("failed to add mapping to svc_pod: %v", err)
+	}
+	log.Info("Added mapping", "svcIP", svcIP, "podIP", podIP)
 
-SvcPodCheck:
-	// Check svc_pod map: key=svc IP → value should be podIP.
-	svcPodElems, err := p.conn.GetSetElements(p.svcPodMap)
-	if err != nil {
-		log.Error(err, "Failed to get svc_pod map elements")
-		return fmt.Errorf("failed to get svc_pod map elements: %v", err)
-	}
-	foundSvc := false
-	for _, el := range svcPodElems {
-		if bytes.Equal(el.Key, parsedSvcIP) {
-			foundSvc = true
-			if !bytes.Equal(el.Val, parsedPodIP) {
-				log.Info("Overriding svc_pod mapping for svcIP", "svcIP", svcIP, "oldPodIP", net.IP(el.Val).String(), "newPodIP", podIP)
-				// Delete the old mapping.
-				if err := p.conn.SetDeleteElements(p.svcPodMap, []nftables.SetElement{{Key: parsedSvcIP, Val: el.Val}}); err != nil {
-					log.Error(err, "Failed to delete old svc_pod mapping", "svcIP", svcIP, "oldPodIP", net.IP(el.Val).String())
-					return fmt.Errorf("failed to delete old svc_pod mapping: %v", err)
-				}
-				// Add the new mapping.
-				if err := p.conn.SetAddElements(p.svcPodMap, []nftables.SetElement{{Key: parsedSvcIP, Val: parsedPodIP}}); err != nil {
-					log.Error(err, "Failed to add new svc_pod mapping", "svcIP", svcIP, "podIP", podIP)
-					return fmt.Errorf("failed to add new svc_pod mapping: %v", err)
-				}
-			}
-			break
-		}
-	}
-	if !foundSvc {
-		if err := p.conn.SetAddElements(p.svcPodMap, []nftables.SetElement{
-			{Key: parsedSvcIP, Val: parsedPodIP},
-		}); err != nil {
-			log.Error(err, "Failed to add mapping to svc_pod", "svcIP", svcIP, "podIP", podIP)
-			return fmt.Errorf("failed to add mapping to svc_pod: %v", err)
-		}
-		log.Info("Added mapping to svc_pod", "svcIP", svcIP, "podIP", podIP)
-	}
-
-	// Ensure the raw sets contain the IPs.
-	if err := p.conn.SetAddElements(p.podSet, []nftables.SetElement{
-		{Key: parsedPodIP},
-	}); err != nil {
+	// --- Update raw sets ---
+	// Remove any outdated entries have already been removed in the conflict loops,
+	// then ensure the new IPs are present.
+	if err := p.conn.SetAddElements(p.podSet, []nftables.SetElement{{Key: parsedPodIP}}); err != nil {
 		log.Error(err, "Failed to add pod IP to pod set", "podIP", podIP)
 		return fmt.Errorf("failed to add pod IP to pod set: %v", err)
 	}
-	if err := p.conn.SetAddElements(p.svcSet, []nftables.SetElement{
-		{Key: parsedSvcIP},
-	}); err != nil {
+	if err := p.conn.SetAddElements(p.svcSet, []nftables.SetElement{{Key: parsedSvcIP}}); err != nil {
 		log.Error(err, "Failed to add svc IP to svc set", "svcIP", svcIP)
 		return fmt.Errorf("failed to add svc IP to svc set: %v", err)
 	}
 
+	// Commit all changes.
 	if err := p.conn.Flush(); err != nil {
 		log.Error(err, "Failed to commit EnsureNAT changes")
 		return fmt.Errorf("failed to commit EnsureNAT changes: %v", err)
@@ -486,73 +498,124 @@ func (p *NFTProxyProcessor) DeleteRules(svcIP, podIP string) error {
 	return nil
 }
 
-// CleanupRules receives a keepMap (keys: svcIP, values: podIP) and removes all mappings
-// and raw set elements not matching an entry in keepMap.
+// CleanupRules receives a keepMap (keys: svcIP, values: podIP) representing the desired state.
+// It recovers from an inconsistent state by:
+// 1. Removing any mappings in the pod_svc and svc_pod maps that do not match keepMap.
+// 2. Adding any missing mappings from keepMap into both maps.
+// 3. Cleaning up the raw sets (pod and svc) so that only the desired IPs remain.
 func (p *NFTProxyProcessor) CleanupRules(keepMap map[string]string) error {
-	log.Info("Starting InitialCleanup", "keepMap", keepMap)
+	log.Info("Starting CleanupRules", "keepMap", keepMap)
 
-	// --- Clean the maps ---
-	// Delete from pod_svc and svc_pod any mapping that is not in keepMap.
+	// --- Step 1: Clean up mapping sets ---
+
+	// Retrieve current mappings from the pod_svc map.
+	// Note: pod_svc maps pod IP → svc IP.
 	podSvcElems, err := p.conn.GetSetElements(p.podSvcMap)
 	if err != nil {
 		log.Error(err, "Failed to get pod_svc elements")
 		return fmt.Errorf("failed to get pod_svc elements: %v", err)
 	}
-	var toDeletePodSvc []nftables.SetElement
-	var toDeleteSvcPod []nftables.SetElement
+
+	// Build a current mapping in svc->pod direction (for easy comparison with keepMap)
+	currentMapping := make(map[string]string) // key: svc, value: pod
 	for _, el := range podSvcElems {
 		pod := net.IP(el.Key).String()
 		svc := net.IP(el.Val).String()
-		if expectedPod, exists := keepMap[svc]; !exists || expectedPod != pod {
-			log.Info("Marking mapping for deletion", "svcIP", svc, "podIP", pod)
-			toDeletePodSvc = append(toDeletePodSvc, nftables.SetElement{Key: el.Key, Val: el.Val})
-			toDeleteSvcPod = append(toDeleteSvcPod, nftables.SetElement{Key: el.Val, Val: el.Key})
-		}
-	}
-	if len(toDeletePodSvc) > 0 {
-		if err := p.conn.SetDeleteElements(p.podSvcMap, toDeletePodSvc); err != nil {
-			log.Error(err, "Failed to delete pod_svc mappings during cleanup")
-			return fmt.Errorf("failed to delete pod_svc mappings: %v", err)
-		}
-		if err := p.conn.SetDeleteElements(p.svcPodMap, toDeleteSvcPod); err != nil {
-			log.Error(err, "Failed to delete svc_pod mappings during cleanup")
-			return fmt.Errorf("failed to delete svc_pod mappings: %v", err)
-		}
-		log.Info("Map cleanup completed successfully")
-	} else {
-		log.Info("No map entries to cleanup")
+		currentMapping[svc] = pod
 	}
 
-	// --- Clean the raw sets ---
-	// For the pod set: remove any pod IP not present in any keepMap value.
+	// Prepare slices for elements to delete from both maps.
+	var toDeletePodSvc []nftables.SetElement
+	var toDeleteSvcPod []nftables.SetElement
+
+	// For each mapping found in the current configuration, if it does not match the desired state, mark it for deletion.
+	for svc, pod := range currentMapping {
+		if expectedPod, ok := keepMap[svc]; !ok || expectedPod != pod {
+			log.Info("Marking inconsistent mapping for deletion", "svcIP", svc, "podIP", pod)
+			// Prepare deletion elements.
+			// pod_svc: key = pod, val = svc.
+			toDeletePodSvc = append(toDeletePodSvc, nftables.SetElement{
+				Key: net.ParseIP(pod).To4(),
+				Val: net.ParseIP(svc).To4(),
+			})
+			// svc_pod: key = svc, val = pod.
+			toDeleteSvcPod = append(toDeleteSvcPod, nftables.SetElement{
+				Key: net.ParseIP(svc).To4(),
+				Val: net.ParseIP(pod).To4(),
+			})
+		}
+	}
+
+	// Delete any inconsistent mappings.
+	if len(toDeletePodSvc) > 0 {
+		if err := p.conn.SetDeleteElements(p.podSvcMap, toDeletePodSvc); err != nil {
+			log.Error(err, "Failed to delete inconsistent mappings from pod_svc")
+			return fmt.Errorf("failed to delete inconsistent mappings from pod_svc: %v", err)
+		}
+		if err := p.conn.SetDeleteElements(p.svcPodMap, toDeleteSvcPod); err != nil {
+			log.Error(err, "Failed to delete inconsistent mappings from svc_pod")
+			return fmt.Errorf("failed to delete inconsistent mappings from svc_pod: %v", err)
+		}
+		log.Info("Inconsistent mappings removed from both maps")
+	} else {
+		log.Info("No inconsistent mappings found in maps")
+	}
+
+	// --- Step 2: Add missing mappings from keepMap ---
+
+	// For every desired mapping in keepMap, ensure it exists in both maps.
+	for svc, pod := range keepMap {
+		// Check if the current mapping for svc exists and matches.
+		if existingPod, ok := currentMapping[svc]; !ok || existingPod != pod {
+			parsedSvcIP := net.ParseIP(svc).To4()
+			parsedPodIP := net.ParseIP(pod).To4()
+			if parsedSvcIP == nil || parsedPodIP == nil {
+				log.Error(nil, "Invalid IP in keepMap", "svcIP", svc, "podIP", pod)
+				continue
+			}
+			// Add mapping to pod_svc (pod → svc)
+			if err := p.conn.SetAddElements(p.podSvcMap, []nftables.SetElement{{Key: parsedPodIP, Val: parsedSvcIP}}); err != nil {
+				log.Error(err, "Failed to add missing mapping to pod_svc", "podIP", pod, "svcIP", svc)
+				return fmt.Errorf("failed to add missing mapping to pod_svc: %v", err)
+			}
+			// Add mapping to svc_pod (svc → pod)
+			if err := p.conn.SetAddElements(p.svcPodMap, []nftables.SetElement{{Key: parsedSvcIP, Val: parsedPodIP}}); err != nil {
+				log.Error(err, "Failed to add missing mapping to svc_pod", "svcIP", svc, "podIP", pod)
+				return fmt.Errorf("failed to add missing mapping to svc_pod: %v", err)
+			}
+			log.Info("Added missing mapping", "svcIP", svc, "podIP", pod)
+		}
+	}
+
+	// --- Step 3: Clean up raw sets ---
+
+	// For the pod set: remove any pod IP that is not present in any desired mapping (keepMap values).
 	podSetElems, err := p.conn.GetSetElements(p.podSet)
 	if err != nil {
 		log.Error(err, "Failed to get pod set elements")
 		return fmt.Errorf("failed to get pod set elements: %v", err)
 	}
 	var toDeletePods []nftables.SetElement
+	// Build a set of desired pod IPs.
+	desiredPods := make(map[string]struct{})
+	for _, pod := range keepMap {
+		desiredPods[pod] = struct{}{}
+	}
 	for _, el := range podSetElems {
 		pod := net.IP(el.Key).String()
-		found := false
-		for _, keepPod := range keepMap {
-			if keepPod == pod {
-				found = true
-				break
-			}
-		}
-		if !found {
-			log.Info("Marking pod IP for deletion from raw set", "podIP", pod)
+		if _, exists := desiredPods[pod]; !exists {
+			log.Info("Marking pod IP for deletion from raw pod set", "podIP", pod)
 			toDeletePods = append(toDeletePods, nftables.SetElement{Key: el.Key})
 		}
 	}
 	if len(toDeletePods) > 0 {
 		if err := p.conn.SetDeleteElements(p.podSet, toDeletePods); err != nil {
-			log.Error(err, "Failed to delete pod IPs from pod set")
-			return fmt.Errorf("failed to delete pod IPs: %v", err)
+			log.Error(err, "Failed to delete extra pod IPs from pod set")
+			return fmt.Errorf("failed to delete extra pod IPs from pod set: %v", err)
 		}
-		log.Info("Pod set cleanup completed successfully")
+		log.Info("Extra pod IPs removed from pod set")
 	} else {
-		log.Info("No pod IPs to delete from pod set")
+		log.Info("No extra pod IPs found in pod set")
 	}
 
 	// For the svc set: remove any svc IP not present as a key in keepMap.
@@ -571,19 +634,38 @@ func (p *NFTProxyProcessor) CleanupRules(keepMap map[string]string) error {
 	}
 	if len(toDeleteSvcs) > 0 {
 		if err := p.conn.SetDeleteElements(p.svcSet, toDeleteSvcs); err != nil {
-			log.Error(err, "Failed to delete svc IPs from svc set")
-			return fmt.Errorf("failed to delete svc IPs: %v", err)
+			log.Error(err, "Failed to delete extra svc IPs from svc set")
+			return fmt.Errorf("failed to delete extra svc IPs from svc set: %v", err)
 		}
-		log.Info("Svc set cleanup completed successfully")
+		log.Info("Extra svc IPs removed from svc set")
 	} else {
-		log.Info("No svc IPs to delete from svc set")
+		log.Info("No extra svc IPs found in svc set")
 	}
 
-	// Final commit.
-	if err := p.conn.Flush(); err != nil {
-		log.Error(err, "Failed to commit raw set cleanup changes")
-		return fmt.Errorf("failed to commit raw set cleanup changes: %v", err)
+	// --- Step 4: Ensure raw sets include all desired IPs ---
+
+	// For the pod set, add any missing pod IPs.
+	for _, pod := range keepMap {
+		parsedPodIP := net.ParseIP(pod).To4()
+		if err := p.conn.SetAddElements(p.podSet, []nftables.SetElement{{Key: parsedPodIP}}); err != nil {
+			log.Error(err, "Failed to add missing pod IP to pod set", "podIP", pod)
+			return fmt.Errorf("failed to add missing pod IP to pod set: %v", err)
+		}
 	}
-	log.Info("InitialCleanup completed successfully")
+	// For the svc set, add any missing svc IPs.
+	for svc := range keepMap {
+		parsedSvcIP := net.ParseIP(svc).To4()
+		if err := p.conn.SetAddElements(p.svcSet, []nftables.SetElement{{Key: parsedSvcIP}}); err != nil {
+			log.Error(err, "Failed to add missing svc IP to svc set", "svcIP", svc)
+			return fmt.Errorf("failed to add missing svc IP to svc set: %v", err)
+		}
+	}
+
+	// --- Final commit ---
+	if err := p.conn.Flush(); err != nil {
+		log.Error(err, "Failed to commit cleanup changes")
+		return fmt.Errorf("failed to commit cleanup changes: %v", err)
+	}
+	log.Info("CleanupRules completed successfully")
 	return nil
 }
