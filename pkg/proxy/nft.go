@@ -34,7 +34,6 @@ type NFTProxyProcessor struct {
 
 // InitRules initializes the nftables configuration in a single table "cozy_proxy".
 // It flushes the entire ruleset, then re-creates the table with the desired sets, maps, and chains.
-// (If a previous table existed, its set elements are saved and then restored.)
 func (p *NFTProxyProcessor) InitRules() error {
 	log.Info("Initializing nftables NAT configuration")
 
@@ -50,43 +49,6 @@ func (p *NFTProxyProcessor) InitRules() error {
 	} else {
 		log.Info("Using existing nftables connection")
 	}
-
-	// --- Save existing table "cozy_proxy" if present ---
-	var savedPod, savedSvc, savedPodSvc, savedSvcPod []nftables.SetElement
-	tables, _ := p.conn.ListTables()
-	var existingTable *nftables.Table
-	for _, t := range tables {
-		if t.Family == nftables.TableFamilyIPv4 && t.Name == "cozy_proxy" {
-			existingTable = t
-			break
-		}
-	}
-	if existingTable != nil {
-		log.Info("Found existing 'cozy_proxy' table; saving set/map elements")
-		// Create dummy set objects for lookup.
-		dummyPod := &nftables.Set{Table: existingTable, Name: "pod", KeyType: nftables.TypeIPAddr}
-		dummySvc := &nftables.Set{Table: existingTable, Name: "svc", KeyType: nftables.TypeIPAddr}
-		dummyPodSvc := &nftables.Set{Table: existingTable, Name: "pod_svc", KeyType: nftables.TypeIPAddr, DataType: nftables.TypeIPAddr, IsMap: true}
-		dummySvcPod := &nftables.Set{Table: existingTable, Name: "svc_pod", KeyType: nftables.TypeIPAddr, DataType: nftables.TypeIPAddr, IsMap: true}
-		if elems, err := p.conn.GetSetElements(dummyPod); err == nil {
-			savedPod = elems
-		}
-		if elems, err := p.conn.GetSetElements(dummySvc); err == nil {
-			savedSvc = elems
-		}
-		if elems, err := p.conn.GetSetElements(dummyPodSvc); err == nil {
-			savedPodSvc = elems
-		}
-		if elems, err := p.conn.GetSetElements(dummySvcPod); err == nil {
-			savedSvcPod = elems
-		}
-	} else {
-		log.Info("No existing 'cozy_proxy' table found; starting fresh")
-	}
-
-	// Flush the entire ruleset.
-	p.conn.FlushRuleset()
-	log.Info("Flushed entire ruleset")
 
 	// --- Create new table "cozy_proxy" ---
 	p.table = p.conn.AddTable(&nftables.Table{
@@ -148,34 +110,12 @@ func (p *NFTProxyProcessor) InitRules() error {
 	}
 	log.Info("Created svc_pod map", "map", p.svcPodMap.Name)
 
-	// Restore saved elements, if any.
-	if len(savedPod) > 0 {
-		if err := p.conn.SetAddElements(p.podSet, savedPod); err != nil {
-			log.Error(err, "Failed to restore elements to pod set")
-			return fmt.Errorf("failed to restore elements to pod set: %v", err)
+	// --- Delete Chains ---
+	chains, _ := p.conn.ListChains()
+	for _, chain := range chains {
+		if chain.Table.Name == p.table.Name {
+			p.conn.DelChain(chain)
 		}
-		log.Info("Restored elements to pod set")
-	}
-	if len(savedSvc) > 0 {
-		if err := p.conn.SetAddElements(p.svcSet, savedSvc); err != nil {
-			log.Error(err, "Failed to restore elements to svc set")
-			return fmt.Errorf("failed to restore elements to svc set: %v", err)
-		}
-		log.Info("Restored elements to svc set")
-	}
-	if len(savedPodSvc) > 0 {
-		if err := p.conn.SetAddElements(p.podSvcMap, savedPodSvc); err != nil {
-			log.Error(err, "Failed to restore elements to pod_svc map")
-			return fmt.Errorf("failed to restore elements to pod_svc map: %v", err)
-		}
-		log.Info("Restored elements to pod_svc map")
-	}
-	if len(savedSvcPod) > 0 {
-		if err := p.conn.SetAddElements(p.svcPodMap, savedSvcPod); err != nil {
-			log.Error(err, "Failed to restore elements to svc_pod map")
-			return fmt.Errorf("failed to restore elements to svc_pod map: %v", err)
-		}
-		log.Info("Restored elements to svc_pod map")
 	}
 
 	// --- Create Chains ---
