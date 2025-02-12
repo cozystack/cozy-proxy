@@ -207,40 +207,33 @@ func (c *ServicesController) Start(ctx context.Context) error {
 func (c *ServicesController) addServiceFunc(obj interface{}) {
 	svc, ok := obj.(*v1.Service)
 	if !ok {
-		// object is not Service
+		// Object is not a Service.
 		return
 	}
 	if !hasWholeIPAnnotation(svc) {
 		return
 	}
 
-	// Retrieve the corresponding endpoint.
+	// Always add the service to the mapping, even if the endpoint is nil.
+	se := &ServiceEndpoints{
+		Service:  svc,
+		Endpoint: nil,
+	}
+	c.Services.Set(svc.Namespace, svc.Name, se)
+
+	// Try to retrieve the corresponding endpoint from the API server.
 	ep, err := c.Clientset.CoreV1().Endpoints(svc.Namespace).Get(context.TODO(), svc.Name, metav1.GetOptions{})
 	if err != nil && !errors.IsNotFound(err) {
 		log.Error(err, "failed to get endpoints for service")
 		return
 	}
-	if ep == nil {
-		// Endpoint not found
-		return
+	// If the endpoint exists and both Service and Endpoint have valid IPs, update the mapping.
+	if err == nil && ep != nil && hasValidEndpointIP(ep) && hasValidServiceIP(svc) {
+		se.Endpoint = ep
+		c.Services.Set(svc.Namespace, svc.Name, se)
+		// Ensure NAT mapping rules are set.
+		c.Proxy.EnsureRules(svc.Status.LoadBalancer.Ingress[0].IP, ep.Subsets[0].Addresses[0].IP)
 	}
-	if !hasValidServiceIP(svc) || !hasValidEndpointIP(ep) {
-		return
-	}
-
-	// Ensure NAT mapping.
-	c.Proxy.EnsureRules(svc.Status.LoadBalancer.Ingress[0].IP, ep.Subsets[0].Addresses[0].IP)
-
-	// Add the service if not already present.
-	if _, exists := c.Services.Get(svc.Namespace, svc.Name); exists {
-		// Service already added
-		return
-	}
-	se := &ServiceEndpoints{
-		Service:  svc,
-		Endpoint: ep,
-	}
-	c.Services.Set(svc.Namespace, svc.Name, se)
 }
 
 // deleteServiceFunc handles the deletion of a service.
@@ -266,81 +259,106 @@ func (c *ServicesController) deleteServiceFunc(obj interface{}) {
 
 // updateServiceFunc handles service updates.
 func (c *ServicesController) updateServiceFunc(oldObj, newObj interface{}) {
+	// Cast the object to a Service type.
 	svc, ok := newObj.(*v1.Service)
 	if !ok {
-		// object is not Service
+		// Object is not a Service.
 		return
 	}
 
-	// If the annotation is missing, delete the service.
+	// If the required annotation is missing, remove the service mapping and delete NAT rules if applicable.
 	if !hasWholeIPAnnotation(svc) {
 		if se, exists := c.Services.Get(svc.Namespace, svc.Name); exists {
 			if hasValidServiceIP(se.Service) && hasValidEndpointIP(se.Endpoint) {
-				c.Proxy.DeleteRules(se.Service.Status.LoadBalancer.Ingress[0].IP, se.Endpoint.Subsets[0].Addresses[0].IP)
+				c.Proxy.DeleteRules(
+					se.Service.Status.LoadBalancer.Ingress[0].IP,
+					se.Endpoint.Subsets[0].Addresses[0].IP,
+				)
 			}
 			c.Services.Delete(svc.Namespace, svc.Name)
 		}
 		return
 	}
 
-	se, exists := c.Services.Get(svc.Namespace, svc.Name)
-	// If the service does not have a valid IP, delete it.
+	// If the service does not have a valid IP, remove the service mapping.
 	if !hasValidServiceIP(svc) {
-		if exists && hasValidServiceIP(se.Service) && hasValidEndpointIP(se.Endpoint) {
-			c.Proxy.DeleteRules(se.Service.Status.LoadBalancer.Ingress[0].IP, se.Endpoint.Subsets[0].Addresses[0].IP)
+		if se, exists := c.Services.Get(svc.Namespace, svc.Name); exists {
+			if hasValidServiceIP(se.Service) && hasValidEndpointIP(se.Endpoint) {
+				c.Proxy.DeleteRules(
+					se.Service.Status.LoadBalancer.Ingress[0].IP,
+					se.Endpoint.Subsets[0].Addresses[0].IP,
+				)
+			}
+			c.Services.Delete(svc.Namespace, svc.Name)
 		}
-		c.Services.Delete(svc.Namespace, svc.Name)
 		return
 	}
 
-	// Retrieve the corresponding endpoint.
+	// Attempt to retrieve the corresponding endpoints.
 	ep, err := c.Clientset.CoreV1().Endpoints(svc.Namespace).Get(context.TODO(), svc.Name, metav1.GetOptions{})
-	if err != nil && !errors.IsNotFound(err) {
-		log.Error(err, "failed to get endpoints for service")
-		return
-	}
-	if ep == nil {
-		// Endpoint not found
-		return
-	}
-	if !hasValidEndpointIP(ep) {
-		if exists && hasValidServiceIP(se.Service) && hasValidEndpointIP(se.Endpoint) {
-			c.Proxy.DeleteRules(se.Service.Status.LoadBalancer.Ingress[0].IP, se.Endpoint.Subsets[0].Addresses[0].IP)
+	if err != nil {
+		// If the error is NotFound, treat the endpoint as nil.
+		if errors.IsNotFound(err) {
+			ep = nil
+		} else {
+			log.Error(err, "failed to get endpoints for service")
+			// Update the mapping with a nil endpoint so it can be updated later.
+			c.Services.Set(svc.Namespace, svc.Name, &ServiceEndpoints{Service: svc, Endpoint: nil})
+			return
 		}
-		c.Services.Delete(svc.Namespace, svc.Name)
+	}
+
+	// If the endpoint is nil or does not have a valid IP,
+	// update the mapping with a nil endpoint and remove any existing NAT rules.
+	if ep == nil || !hasValidEndpointIP(ep) {
+		if se, exists := c.Services.Get(svc.Namespace, svc.Name); exists &&
+			hasValidServiceIP(se.Service) && hasValidEndpointIP(se.Endpoint) {
+			c.Proxy.DeleteRules(
+				se.Service.Status.LoadBalancer.Ingress[0].IP,
+				se.Endpoint.Subsets[0].Addresses[0].IP,
+			)
+		}
+		c.Services.Set(svc.Namespace, svc.Name, &ServiceEndpoints{Service: svc, Endpoint: nil})
 		return
 	}
 
-	// Ensure NAT mapping is up to date.
-	c.Proxy.EnsureRules(svc.Status.LoadBalancer.Ingress[0].IP, ep.Subsets[0].Addresses[0].IP)
-	if exists {
-		se.Service = svc
-		se.Endpoint = ep
-		c.Services.Set(svc.Namespace, svc.Name, se)
-	} else {
-		c.Services.Set(svc.Namespace, svc.Name, &ServiceEndpoints{Service: svc, Endpoint: ep})
-	}
+	// At this point, both the Service and Endpoint have valid IPs.
+	// Ensure NAT mapping is up-to-date.
+	c.Proxy.EnsureRules(
+		svc.Status.LoadBalancer.Ingress[0].IP,
+		ep.Subsets[0].Addresses[0].IP,
+	)
+
+	// Update or add the service mapping with the new endpoint.
+	c.Services.Set(svc.Namespace, svc.Name, &ServiceEndpoints{Service: svc, Endpoint: ep})
 }
 
 // addEndpointFunc handles the addition of endpoints.
 func (c *ServicesController) addEndpointFunc(obj interface{}) {
+	// Cast the object to an Endpoints type.
 	ep, ok := obj.(*v1.Endpoints)
 	if !ok {
-		// object is not Endpoints
+		// Object is not an Endpoints.
 		return
 	}
 
+	// Retrieve the ServiceEndpoints mapping for the service.
 	se, exists := c.Services.Get(ep.Namespace, ep.Name)
 	if !exists {
-		// Service is not managed by us
+		// If the service is not managed by us, do nothing.
 		return
 	}
-	// Update the endpoint in the service map.
+
+	// Update the endpoint in the mapping.
 	c.Services.SetEndpoint(ep.Namespace, ep.Name, ep)
-	if !hasValidServiceIP(se.Service) || !hasValidEndpointIP(ep) {
-		return
+
+	// If both the Service and the Endpoint have valid IPs, ensure NAT mapping rules.
+	if hasValidServiceIP(se.Service) && hasValidEndpointIP(ep) {
+		c.Proxy.EnsureRules(
+			se.Service.Status.LoadBalancer.Ingress[0].IP,
+			ep.Subsets[0].Addresses[0].IP,
+		)
 	}
-	c.Proxy.EnsureRules(se.Service.Status.LoadBalancer.Ingress[0].IP, ep.Subsets[0].Addresses[0].IP)
 }
 
 // deleteEndpointFunc handles endpoint deletions.
@@ -395,15 +413,38 @@ func (c *ServicesController) updateEndpointFunc(oldObj, newObj interface{}) {
 }
 
 // hasValidServiceIP checks whether the service has a valid IP.
+// It returns false if the service is nil, if the LoadBalancer Ingress slice is empty,
+// or if the first Ingress entry does not have a valid (non-empty) IP.
 func hasValidServiceIP(svc *v1.Service) bool {
-	return len(svc.Status.LoadBalancer.Ingress) > 0 && svc.Status.LoadBalancer.Ingress[0].IP != ""
+	// Return false if svc is nil.
+	if svc == nil {
+		return false
+	}
+	// Ensure that there is at least one LoadBalancer Ingress.
+	if len(svc.Status.LoadBalancer.Ingress) == 0 {
+		return false
+	}
+	// Check if the first Ingress has a non-empty IP.
+	return svc.Status.LoadBalancer.Ingress[0].IP != ""
 }
 
 // hasValidEndpointIP checks whether the endpoints have a valid IP.
+// It returns false if the endpoints object is nil or does not contain a valid IP.
 func hasValidEndpointIP(ep *v1.Endpoints) bool {
-	return len(ep.Subsets) > 0 &&
-		len(ep.Subsets[0].Addresses) > 0 &&
-		ep.Subsets[0].Addresses[0].IP != ""
+	// Return false if ep is nil.
+	if ep == nil {
+		return false
+	}
+	// Ensure that there is at least one subset.
+	if len(ep.Subsets) == 0 {
+		return false
+	}
+	// Ensure that the first subset contains at least one address.
+	if len(ep.Subsets[0].Addresses) == 0 {
+		return false
+	}
+	// Check if the first address has a non-empty IP.
+	return ep.Subsets[0].Addresses[0].IP != ""
 }
 
 // hasWholeIPAnnotation checks if the service has the wholeIP annotation set to true.
