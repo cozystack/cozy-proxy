@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"net"
 
@@ -388,6 +389,8 @@ func (p *NFTProxyProcessor) EnsureRules(svcIP, podIP string) error {
 // This ensures that the raw_prerouting chain no longer matches these IPs.
 func (p *NFTProxyProcessor) DeleteRules(svcIP, podIP string) error {
 	log.Info("Deleting NAT mapping", "svcIP", svcIP, "podIP", podIP)
+
+	// Parse svcIP and podIP into IPv4 byte slices.
 	parsedSvcIP := net.ParseIP(svcIP).To4()
 	if parsedSvcIP == nil {
 		return fmt.Errorf("invalid svcIP: %s", svcIP)
@@ -429,11 +432,18 @@ func (p *NFTProxyProcessor) DeleteRules(svcIP, podIP string) error {
 		return fmt.Errorf("failed to delete svc IP from svc set: %v", err)
 	}
 
-	// Flush all changes.
+	// Commit all changes.
 	if err := p.conn.Flush(); err != nil {
-		log.Error(err, "Failed to commit DeleteNAT changes")
-		return fmt.Errorf("failed to commit DeleteNAT changes: %v", err)
+		// Check if the error is ENOENT (no such file or directory) and ignore it.
+		// This may happen if the elements or even the table were already removed.
+		if errors.Is(err, unix.ENOENT) {
+			log.Info("Ignoring ENOENT error during flush in DeleteRules", "error", err)
+		} else {
+			log.Error(err, "Failed to commit DeleteNAT changes")
+			return fmt.Errorf("failed to commit DeleteNAT changes: %v", err)
+		}
 	}
+
 	log.Info("NAT mapping and raw set elements deleted successfully", "svcIP", svcIP, "podIP", podIP)
 	return nil
 }
