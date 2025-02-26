@@ -460,9 +460,18 @@ func (c *ServicesController) cleanupRemovedServices() error {
 	allServices := c.Services.GetAll()
 	for _, serviceEndpoints := range allServices {
 		if serviceEndpoints.Service != nil && serviceEndpoints.Endpoint != nil {
-			serviceIP := serviceEndpoints.Service.Status.LoadBalancer.Ingress[0].IP
-			endpointIP := serviceEndpoints.Endpoint.Subsets[0].Addresses[0].IP
-			keepMap[serviceIP] = endpointIP
+			var serviceIP, endpointIP string
+
+			if len(serviceEndpoints.Service.Status.LoadBalancer.Ingress) > 0 {
+				serviceIP = serviceEndpoints.Service.Status.LoadBalancer.Ingress[0].IP
+			}
+			if len(serviceEndpoints.Endpoint.Subsets) > 0 && len(serviceEndpoints.Endpoint.Subsets[0].Addresses) > 0 {
+				endpointIP = serviceEndpoints.Endpoint.Subsets[0].Addresses[0].IP
+			}
+
+			if serviceIP != "" && endpointIP != "" {
+				keepMap[serviceIP] = endpointIP
+			}
 		}
 	}
 	// Call InitialCleanup with the snapshot.
