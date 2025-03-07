@@ -6,8 +6,8 @@ import (
 
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
-	"github.com/aenix-io/cozy-proxy/pkg/controllers"
-	"github.com/aenix-io/cozy-proxy/pkg/proxy"
+	"github.com/cozystack/cozy-proxy/pkg/controllers"
+	"github.com/cozystack/cozy-proxy/pkg/proxy"
 
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"

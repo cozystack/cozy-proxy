@@ -1,4 +1,4 @@
-module github.com/aenix-io/cozy-proxy
+module github.com/cozystack/cozy-proxy
 
 go 1.23.4
 
