@@ -15,7 +15,7 @@ import (
 	"k8s.io/client-go/tools/cache"
 	ctrl "sigs.k8s.io/controller-runtime"
 
-	nat "github.com/aenix-io/cozy-proxy/pkg/proxy"
+	nat "github.com/cozystack/cozy-proxy/pkg/proxy"
 )
 
 var (

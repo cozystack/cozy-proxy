@@ -1,4 +1,4 @@
-IMAGE ?= ghcr.io/aenix-io/cozystack/cozy-proxy
+IMAGE ?= ghcr.io/cozystack/cozystack/cozy-proxy
 TAG ?= latest
 PUSH ?= true
 LOAD ?= false
