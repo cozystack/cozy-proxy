@@ -12,4 +12,5 @@ image-cozy-proxy:
 		--cache-from type=registry,ref=$(IMAGE):latest \
 		--cache-to type=inline \
 		--push=$(PUSH) \
+		--label "org.opencontainers.image.source=https://github.com/cozystack/cozy-proxy" \
 		--load=$(LOAD)
