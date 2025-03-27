@@ -13,7 +13,9 @@ There are several ways to achieve this:
 - Adding a secondary interface with Multus.
 - Using native Kubernetes services with externalIPs and exposing them via MetalLB.
 
-The last option is the simplest and most flexible, but it has a limitation: Kubernetes services do not forward all traffic—only traffic on specific ports (see: [Kubernetes Issue #23864](https://github.com/kubernetes/kubernetes/issues/23864)). Additionally, kube-proxy does not perform SNAT, which causes outgoing traffic from the pod to use the 
+The last option is the simplest and most flexible, but it has a limitation: Kubernetes services do not forward all traffic,
+but only traffic on specific ports (see: [Kubernetes Issue #23864](https://github.com/kubernetes/kubernetes/issues/23864)).
+Additionally, kube-proxy does not perform SNAT, which causes outgoing traffic from the pod to use the default gateway of the host where it is running.
 
 To address these issues, we have added an additional controller that performs 1:1 NAT for services annotated with `networking.cozystack.io/wholeIP=true`.
 
@@ -33,7 +35,7 @@ helm install cozy-proxy charts/cozy-proxy -n kube-system
 
 ## Usage
 
-Create LoadBalancer service with `networking.cozystack.io/wholeIP=true` annotation:
+Create a LoadBalancer service with `networking.cozystack.io/wholeIP=true` annotation:
 
 ```yaml
 apiVersion: v1
@@ -69,14 +71,14 @@ Check that the service has an external IP:
 kubectl get svc
 ```
 
-example output:
+Example output:
 
 ```console
 NAME              TYPE           CLUSTER-IP     EXTERNAL-IP     PORT(S)     AGE
 example-service   LoadBalancer   10.96.195.46   1.2.3.4         65535/TCP   84s
 ```
 
-Now try to access serivce using `icmp` and `tcp`, both should work:
+Now try to access the service using `icmp` and `tcp`; both should work:
 
 ```bash
 ping 1.2.3.4
@@ -89,7 +91,7 @@ Check external IP from inside the pod:
 kubectl exec -ti nginx -- curl icanhazip.com
 ```
 
-example output whould be the same as the service external IP:
+Example output would be the same as the service external IP:
 ```console
 1.2.3.4
 ```
