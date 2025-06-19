@@ -120,86 +120,20 @@ func (p *NFTProxyProcessor) InitRules() error {
 	}
 
 	// --- Create Chains ---
-	// Chain "raw_prerouting": hook prerouting, priority raw.
-	p.rawPrerouting = p.conn.AddChain(&nftables.Chain{
-		Name:     "raw_prerouting",
+	earlySNAT := p.conn.AddChain(&nftables.Chain{
+		Name:     "early_snat",
 		Table:    p.table,
 		Type:     nftables.ChainTypeFilter,
 		Hooknum:  nftables.ChainHookPrerouting,
 		Priority: nftables.ChainPriorityRaw,
 	})
-	log.Info("Created raw_prerouting chain", "chain", p.rawPrerouting.Name)
-
-	// Chain "nat_output": hook postrouting, priority (srcnat + 1).
-	p.natOutput = p.conn.AddChain(&nftables.Chain{
-		Name:     "nat_output",
-		Table:    p.table,
-		Type:     nftables.ChainTypeFilter,
-		Hooknum:  nftables.ChainHookPostrouting,
-		Priority: nftables.ChainPriorityRef(*nftables.ChainPriorityNATSource + 1),
-	})
-	log.Info("Created nat_output chain", "chain", p.natOutput.Name)
-
-	// Chain "nat_prerouting": hook prerouting, priority (dstnat + 1).
-	p.natPrerouting = p.conn.AddChain(&nftables.Chain{
-		Name:     "nat_prerouting",
-		Table:    p.table,
-		Type:     nftables.ChainTypeFilter,
-		Hooknum:  nftables.ChainHookPrerouting,
-		Priority: nftables.ChainPriorityRef(*nftables.ChainPriorityNATDest + 1),
-	})
-	log.Info("Created nat_prerouting chain", "chain", p.natPrerouting.Name)
+	log.Info("Created early_snat chain")
 
 	// --- Add Rules ---
-	// In raw_prerouting: two rules are added in one call.
-
-	// Add rule for source addresses.
+	// Add SNAT rule: ip saddr @pod ip saddr set ip saddr map @pod_svc
 	p.conn.AddRule(&nftables.Rule{
 		Table: p.table,
-		Chain: p.rawPrerouting,
-		Exprs: []expr.Any{
-			&expr.Payload{
-				DestRegister: 1,
-				Base:         expr.PayloadBaseNetworkHeader,
-				Offset:       12,
-				Len:          4,
-			},
-			&expr.Lookup{
-				SourceRegister: 1,
-				SetName:        p.podSet.Name,
-				SetID:          p.podSet.ID,
-			},
-			&expr.Notrack{},
-			&expr.Verdict{Kind: expr.VerdictReturn},
-		},
-	})
-
-	// Add rule for destination addresses.
-	p.conn.AddRule(&nftables.Rule{
-		Table: p.table,
-		Chain: p.rawPrerouting,
-		Exprs: []expr.Any{
-			&expr.Payload{
-				DestRegister: 1,
-				Base:         expr.PayloadBaseNetworkHeader,
-				Offset:       16,
-				Len:          4,
-			},
-			&expr.Lookup{
-				SourceRegister: 1,
-				SetName:        p.svcSet.Name,
-				SetID:          p.svcSet.ID,
-			},
-			&expr.Notrack{},
-			&expr.Verdict{Kind: expr.VerdictReturn},
-		},
-	})
-	log.Info("Added rules to raw_prerouting chain")
-
-	// In nat_output: SNAT rule: ip saddr set ip saddr map @pod_svc
-	p.conn.AddRule(&nftables.Rule{
-		Table: p.table,
-		Chain: p.natOutput,
+		Chain: earlySNAT,
 		Exprs: []expr.Any{
 			&expr.Payload{
 				DestRegister: 1,
@@ -226,12 +160,11 @@ func (p *NFTProxyProcessor) InitRules() error {
 			},
 		},
 	})
-	log.Info("Added SNAT rule to nat_output chain")
 
-	// In nat_prerouting: DNAT rule: ip daddr set ip daddr map @svc_pod
+	// Add DNAT rule: ip daddr @svc ip daddr set ip daddr map @svc_pod
 	p.conn.AddRule(&nftables.Rule{
 		Table: p.table,
-		Chain: p.natPrerouting,
+		Chain: earlySNAT,
 		Exprs: []expr.Any{
 			&expr.Payload{
 				DestRegister: 1,
@@ -258,7 +191,7 @@ func (p *NFTProxyProcessor) InitRules() error {
 			},
 		},
 	})
-	log.Info("Added DNAT rule to nat_prerouting chain")
+	log.Info("Added early_snat rules (SNAT and DNAT)")
 
 	// Commit all changes.
 	if err := p.conn.Flush(); err != nil {
