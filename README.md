@@ -88,7 +88,7 @@ helm install cozy-proxy charts/cozy-proxy -n kube-system
 
 ## Usage
 
-Create a LoadBalancer service with the `service.kubernetes.io/service-proxy-name: cozy-proxy` label. This also tells kube-proxy to stay away from the service. The `networking.cozystack.io/wholeIP: "true"` annotation is shown for clarity but is optional when the label is present:
+Create a LoadBalancer service with the `service.kubernetes.io/service-proxy-name: cozy-proxy` label. This also tells kube-proxy to stay away from the service:
 
 ```yaml
 apiVersion: v1
@@ -97,8 +97,6 @@ metadata:
   name: example-service
   labels:
     service.kubernetes.io/service-proxy-name: cozy-proxy
-  annotations:
-    networking.cozystack.io/wholeIP: "true"
 spec:
   allocateLoadBalancerNodePorts: false
   externalTrafficPolicy: Local
