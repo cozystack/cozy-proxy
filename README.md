@@ -17,24 +17,35 @@ The last option is the simplest and most flexible, but it has a limitation: Kube
 but only traffic on specific ports (see: [Kubernetes Issue #23864](https://github.com/kubernetes/kubernetes/issues/23864)).
 Additionally, kube-proxy does not perform SNAT, which causes outgoing traffic from the pod to use the default gateway of the host where it is running.
 
-To address these issues, we have added an additional controller that performs 1:1 NAT for services annotated with `networking.cozystack.io/wholeIP`.
+To address these issues, we have added an additional controller that performs 1:1 NAT for services selected by either the `service.kubernetes.io/service-proxy-name: cozy-proxy` label or the `networking.cozystack.io/wholeIP` annotation.
 
 ## How It Works
 
-cozy-proxy is a simple Kubernetes controller that watches for services with the `networking.cozystack.io/wholeIP` annotation. When it finds such a service, it creates an NFT rule that forwards traffic from the service's external IP to the pod's IP and vice versa, performing source-IP preservation for egress traffic.
+cozy-proxy is a simple Kubernetes controller that watches for services selected by either of the following:
+
+- **`service.kubernetes.io/service-proxy-name: cozy-proxy`** label (recommended) — the standard Kubernetes mechanism for delegating a service to a non-default proxy. kube-proxy skips services carrying this label, so cozy-proxy becomes the sole handler and no rules collide.
+- **`networking.cozystack.io/wholeIP`** annotation — also selects the service for management. The annotation value additionally drives the ingress mode (see below).
+
+When it finds such a service, it creates NFT rules that forward traffic from the service's external IP to the pod's IP and vice versa, performing source-IP preservation for egress traffic.
 
 This controller can be used together with kube-proxy and Cilium in kube-proxy replacement mode.
 
-## Service annotations
+### Which selector should I use?
 
-cozy-proxy reacts to Services that carry the `networking.cozystack.io/wholeIP`
-annotation. The annotation value selects the ingress mode:
+- If your cluster runs **plain kube-proxy** (iptables or IPVS mode) — for example, a default RKE2/kubeadm install with Calico or Flannel — use the `service.kubernetes.io/service-proxy-name: cozy-proxy` label. Without it, kube-proxy installs its own LoadBalancer rules that conflict with cozy-proxy's NAT and break outbound SNAT.
+- If your cluster runs **Cilium in kube-proxy replacement mode** (as in the reference Cozystack environment), either selector works.
+
+You can safely set both on the same service.
+
+## Ingress mode
+
+The `networking.cozystack.io/wholeIP` annotation value selects the ingress mode:
 
 | Value     | Behavior                                                                                                        |
 |-----------|-----------------------------------------------------------------------------------------------------------------|
 | `"true"`  | **Whole-IP passthrough.** All TCP/UDP traffic to the LoadBalancer IP is forwarded to the backend pod.           |
 | `"false"` | **Per-port filtering.** Only TCP/UDP traffic to ports listed in `Service.spec.ports` is forwarded; rest dropped.|
-| absent    | Service is not managed by cozy-proxy.                                                                           |
+| absent    | Defaults to **passthrough** (services selected by label only behave the same as `wholeIP: "true"`).             |
 
 In both managed modes, egress traffic from the backend pod is SNATed to the
 LoadBalancer IP for source-IP preservation.
@@ -77,15 +88,17 @@ helm install cozy-proxy charts/cozy-proxy -n kube-system
 
 ## Usage
 
-Create a LoadBalancer service with `networking.cozystack.io/wholeIP: "true"` annotation:
+Create a LoadBalancer service with the `service.kubernetes.io/service-proxy-name: cozy-proxy` label. This also tells kube-proxy to stay away from the service. The `networking.cozystack.io/wholeIP: "true"` annotation is shown for clarity but is optional when the label is present:
 
 ```yaml
 apiVersion: v1
 kind: Service
 metadata:
+  name: example-service
+  labels:
+    service.kubernetes.io/service-proxy-name: cozy-proxy
   annotations:
     networking.cozystack.io/wholeIP: "true"
-  name: example-service
 spec:
   allocateLoadBalancerNodePorts: false
   externalTrafficPolicy: Local
