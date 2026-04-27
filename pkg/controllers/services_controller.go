@@ -235,16 +235,7 @@ func (c *ServicesController) addServiceFunc(obj interface{}) {
 		podIP := ep.Subsets[0].Addresses[0].IP
 		// Ensure NAT mapping rules are set.
 		c.Proxy.EnsureRules(svcIP, podIP)
-		// Apply (or remove) port filtering depending on annotation value.
-		if wholeIPPassthrough(svc) {
-			if err := c.Proxy.DeletePortFilter(svcIP, podIP); err != nil {
-				log.Error(err, "failed to delete port filter", "svcIP", svcIP, "podIP", podIP)
-			}
-		} else {
-			if err := c.Proxy.EnsurePortFilter(svcIP, podIP, svc.Spec.Ports); err != nil {
-				log.Error(err, "failed to ensure port filter", "svcIP", svcIP, "podIP", podIP)
-			}
-		}
+		c.reconcilePortFilter(svc, svcIP, podIP, "on svc add")
 	}
 }
 
@@ -267,9 +258,7 @@ func (c *ServicesController) deleteServiceFunc(obj interface{}) {
 
 	svcIP := se.Service.Status.LoadBalancer.Ingress[0].IP
 	podIP := se.Endpoint.Subsets[0].Addresses[0].IP
-	if err := c.Proxy.DeletePortFilter(svcIP, podIP); err != nil {
-		log.Error(err, "failed to delete port filter on svc deletion", "svcIP", svcIP, "podIP", podIP)
-	}
+	c.clearPortFilter(svcIP, podIP, "on svc deletion")
 	c.Proxy.DeleteRules(svcIP, podIP)
 	c.Services.Delete(svc.Namespace, svc.Name)
 }
@@ -289,9 +278,7 @@ func (c *ServicesController) updateServiceFunc(oldObj, newObj interface{}) {
 			if hasValidServiceIP(se.Service) && hasValidEndpointIP(se.Endpoint) {
 				svcIP := se.Service.Status.LoadBalancer.Ingress[0].IP
 				podIP := se.Endpoint.Subsets[0].Addresses[0].IP
-				if err := c.Proxy.DeletePortFilter(svcIP, podIP); err != nil {
-					log.Error(err, "failed to delete port filter", "svcIP", svcIP, "podIP", podIP)
-				}
+				c.clearPortFilter(svcIP, podIP, "on annotation removal")
 				c.Proxy.DeleteRules(svcIP, podIP)
 			}
 			c.Services.Delete(svc.Namespace, svc.Name)
@@ -305,9 +292,7 @@ func (c *ServicesController) updateServiceFunc(oldObj, newObj interface{}) {
 			if hasValidServiceIP(se.Service) && hasValidEndpointIP(se.Endpoint) {
 				svcIP := se.Service.Status.LoadBalancer.Ingress[0].IP
 				podIP := se.Endpoint.Subsets[0].Addresses[0].IP
-				if err := c.Proxy.DeletePortFilter(svcIP, podIP); err != nil {
-					log.Error(err, "failed to delete port filter", "svcIP", svcIP, "podIP", podIP)
-				}
+				c.clearPortFilter(svcIP, podIP, "on svc IP loss")
 				c.Proxy.DeleteRules(svcIP, podIP)
 			}
 			c.Services.Delete(svc.Namespace, svc.Name)
@@ -348,15 +333,7 @@ func (c *ServicesController) updateServiceFunc(oldObj, newObj interface{}) {
 	svcIP := svc.Status.LoadBalancer.Ingress[0].IP
 	podIP := ep.Subsets[0].Addresses[0].IP
 	c.Proxy.EnsureRules(svcIP, podIP)
-	if wholeIPPassthrough(svc) {
-		if err := c.Proxy.DeletePortFilter(svcIP, podIP); err != nil {
-			log.Error(err, "failed to delete port filter", "svcIP", svcIP, "podIP", podIP)
-		}
-	} else {
-		if err := c.Proxy.EnsurePortFilter(svcIP, podIP, svc.Spec.Ports); err != nil {
-			log.Error(err, "failed to ensure port filter", "svcIP", svcIP, "podIP", podIP)
-		}
-	}
+	c.reconcilePortFilter(svc, svcIP, podIP, "on svc update")
 
 	// Update or add the service mapping with the new endpoint.
 	c.Services.Set(svc.Namespace, svc.Name, &ServiceEndpoints{Service: svc, Endpoint: ep})
@@ -386,16 +363,7 @@ func (c *ServicesController) addEndpointFunc(obj interface{}) {
 		svcIP := se.Service.Status.LoadBalancer.Ingress[0].IP
 		podIP := ep.Subsets[0].Addresses[0].IP
 		c.Proxy.EnsureRules(svcIP, podIP)
-		// Mirror the port-filter state to the new endpoint.
-		if wholeIPPassthrough(se.Service) {
-			if err := c.Proxy.DeletePortFilter(svcIP, podIP); err != nil {
-				log.Error(err, "failed to delete port filter on endpoint add", "svcIP", svcIP, "podIP", podIP)
-			}
-		} else {
-			if err := c.Proxy.EnsurePortFilter(svcIP, podIP, se.Service.Spec.Ports); err != nil {
-				log.Error(err, "failed to ensure port filter on endpoint add", "svcIP", svcIP, "podIP", podIP)
-			}
-		}
+		c.reconcilePortFilter(se.Service, svcIP, podIP, "on endpoint add")
 	}
 }
 
@@ -417,9 +385,7 @@ func (c *ServicesController) deleteEndpointFunc(obj interface{}) {
 	}
 	svcIP := se.Service.Status.LoadBalancer.Ingress[0].IP
 	podIP := se.Endpoint.Subsets[0].Addresses[0].IP
-	if err := c.Proxy.DeletePortFilter(svcIP, podIP); err != nil {
-		log.Error(err, "failed to delete port filter on endpoint delete", "svcIP", svcIP, "podIP", podIP)
-	}
+	c.clearPortFilter(svcIP, podIP, "on endpoint delete")
 	c.Proxy.DeleteRules(svcIP, podIP)
 	// Set the endpoint to nil.
 	c.Services.SetEndpoint(ep.Namespace, ep.Name, nil)
@@ -442,9 +408,7 @@ func (c *ServicesController) updateEndpointFunc(oldObj, newObj interface{}) {
 		if hasValidServiceIP(se.Service) && hasValidEndpointIP(se.Endpoint) {
 			svcIP := se.Service.Status.LoadBalancer.Ingress[0].IP
 			oldPodIP := se.Endpoint.Subsets[0].Addresses[0].IP
-			if err := c.Proxy.DeletePortFilter(svcIP, oldPodIP); err != nil {
-				log.Error(err, "failed to delete port filter on endpoint invalidation", "svcIP", svcIP, "podIP", oldPodIP)
-			}
+			c.clearPortFilter(svcIP, oldPodIP, "on endpoint invalidation")
 			c.Proxy.DeleteRules(svcIP, oldPodIP)
 		}
 		c.Services.SetEndpoint(ep.Namespace, ep.Name, ep)
@@ -459,15 +423,7 @@ func (c *ServicesController) updateEndpointFunc(oldObj, newObj interface{}) {
 	svcIP := se.Service.Status.LoadBalancer.Ingress[0].IP
 	podIP := ep.Subsets[0].Addresses[0].IP
 	c.Proxy.EnsureRules(svcIP, podIP)
-	if wholeIPPassthrough(se.Service) {
-		if err := c.Proxy.DeletePortFilter(svcIP, podIP); err != nil {
-			log.Error(err, "failed to delete port filter on endpoint update", "svcIP", svcIP, "podIP", podIP)
-		}
-	} else {
-		if err := c.Proxy.EnsurePortFilter(svcIP, podIP, se.Service.Spec.Ports); err != nil {
-			log.Error(err, "failed to ensure port filter on endpoint update", "svcIP", svcIP, "podIP", podIP)
-		}
-	}
+	c.reconcilePortFilter(se.Service, svcIP, podIP, "on endpoint update")
 	c.Services.SetEndpoint(ep.Namespace, ep.Name, ep)
 }
 
@@ -506,7 +462,10 @@ func hasValidEndpointIP(ep *v1.Endpoints) bool {
 	return ep.Subsets[0].Addresses[0].IP != ""
 }
 
-const wholeIPAnnotation = "networking.cozystack.io/wholeIP"
+const (
+	wholeIPAnnotation   = "networking.cozystack.io/wholeIP"
+	allowICMPAnnotation = "networking.cozystack.io/allowICMP"
+)
 
 // hasWholeIPAnnotation reports whether the service is opted into cozy-proxy
 // management via the wholeIP annotation. Any value triggers management — the
@@ -528,6 +487,54 @@ func wholeIPPassthrough(svc *v1.Service) bool {
 		return true
 	}
 	return svc.Annotations[wholeIPAnnotation] != "false"
+}
+
+// allowICMP reports whether ICMP traffic should bypass the port_filter drop
+// rule for this service. Only meaningful in port-filter mode (wholeIP=false);
+// in passthrough mode the port_filter drop rule does not apply at all.
+func allowICMP(svc *v1.Service) bool {
+	if svc == nil || svc.Annotations == nil {
+		return false
+	}
+	return svc.Annotations[allowICMPAnnotation] == "true"
+}
+
+// reconcilePortFilter applies the port-filter and ICMP-allow state implied by
+// the service's annotations. Call sites pass the resolved svcIP/podIP and a
+// short context string that ends up in error logs.
+func (c *ServicesController) reconcilePortFilter(svc *v1.Service, svcIP, podIP, ctx string) {
+	if wholeIPPassthrough(svc) {
+		if err := c.Proxy.DeletePortFilter(svcIP, podIP); err != nil {
+			log.Error(err, "failed to delete port filter "+ctx, "svcIP", svcIP, "podIP", podIP)
+		}
+		if err := c.Proxy.DeleteICMPAllow(svcIP, podIP); err != nil {
+			log.Error(err, "failed to delete ICMP allow "+ctx, "svcIP", svcIP, "podIP", podIP)
+		}
+		return
+	}
+	if err := c.Proxy.EnsurePortFilter(svcIP, podIP, svc.Spec.Ports); err != nil {
+		log.Error(err, "failed to ensure port filter "+ctx, "svcIP", svcIP, "podIP", podIP)
+	}
+	if allowICMP(svc) {
+		if err := c.Proxy.EnsureICMPAllow(svcIP, podIP); err != nil {
+			log.Error(err, "failed to ensure ICMP allow "+ctx, "svcIP", svcIP, "podIP", podIP)
+		}
+	} else {
+		if err := c.Proxy.DeleteICMPAllow(svcIP, podIP); err != nil {
+			log.Error(err, "failed to delete ICMP allow "+ctx, "svcIP", svcIP, "podIP", podIP)
+		}
+	}
+}
+
+// clearPortFilter unconditionally removes both port-filter and ICMP-allow
+// state for (svcIP, podIP). Used by delete paths.
+func (c *ServicesController) clearPortFilter(svcIP, podIP, ctx string) {
+	if err := c.Proxy.DeletePortFilter(svcIP, podIP); err != nil {
+		log.Error(err, "failed to delete port filter "+ctx, "svcIP", svcIP, "podIP", podIP)
+	}
+	if err := c.Proxy.DeleteICMPAllow(svcIP, podIP); err != nil {
+		log.Error(err, "failed to delete ICMP allow "+ctx, "svcIP", svcIP, "podIP", podIP)
+	}
 }
 
 // cleanupRemovedServices performs an initial cleanup for removed services.
@@ -576,6 +583,24 @@ func (c *ServicesController) cleanupRemovedServices() error {
 	}
 	if err := c.Proxy.CleanupPortFilters(keepFilters); err != nil {
 		return fmt.Errorf("failed to perform port-filter cleanup: %w", err)
+	}
+	// Build ICMP-allow snapshot: services in port-filter mode that opt into
+	// ICMP via the allowICMP annotation.
+	keepICMP := make(map[string]string)
+	for _, se := range allServices {
+		if se.Service == nil || se.Endpoint == nil {
+			continue
+		}
+		if !hasValidServiceIP(se.Service) || !hasValidEndpointIP(se.Endpoint) {
+			continue
+		}
+		if wholeIPPassthrough(se.Service) || !allowICMP(se.Service) {
+			continue
+		}
+		keepICMP[se.Service.Status.LoadBalancer.Ingress[0].IP] = se.Endpoint.Subsets[0].Addresses[0].IP
+	}
+	if err := c.Proxy.CleanupICMPAllow(keepICMP); err != nil {
+		return fmt.Errorf("failed to perform ICMP-allow cleanup: %w", err)
 	}
 	return nil
 }

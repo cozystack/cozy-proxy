@@ -39,6 +39,14 @@ annotation. The annotation value selects the ingress mode:
 In both managed modes, egress traffic from the backend pod is SNATed to the
 LoadBalancer IP for source-IP preservation.
 
+The optional `networking.cozystack.io/allowICMP: "true"` annotation, only
+meaningful in port-filter mode (`wholeIP: "false"`), accepts ICMP traffic
+toward the backend pod IP that would otherwise be dropped by the per-port
+filter. Without it, all ICMP to a port-filtered pod is dropped — which also
+blocks `ping`, **PMTU discovery** (ICMP "fragmentation needed"), and ICMP
+unreachable signalling. Recommended for any service where path-MTU mismatches
+or observability matter.
+
 ## Datapath
 
 The nftables ruleset placed in table `ip cozy_proxy` consists of:
@@ -55,7 +63,9 @@ The nftables ruleset placed in table `ip cozy_proxy` consists of:
   `(daddr, l4proto, dport)` is not in `allowed_ports`. The chain accepts
   packets in conntrack states `established` or `related` first, so reply
   packets of egress flows bypass the filter even when their dport is the VM's
-  ephemeral source port.
+  ephemeral source port. ICMP is dropped by default; if the
+  `allowICMP: "true"` annotation is set, the pod IP is added to
+  `icmp_allowed_pods` and ICMP toward it is accepted before the drop rule.
 
 ## Installation
 

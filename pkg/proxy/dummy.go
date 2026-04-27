@@ -43,5 +43,20 @@ func (d *DummyProxyProcessor) CleanupPortFilters(keep map[string]PortFilterEntry
 	return nil
 }
 
+func (d *DummyProxyProcessor) EnsureICMPAllow(SvcIP, PodIP string) error {
+	fmt.Printf("EnsureICMPAllow called with SvcIP: %s, PodIP: %s\n", SvcIP, PodIP)
+	return nil
+}
+
+func (d *DummyProxyProcessor) DeleteICMPAllow(SvcIP, PodIP string) error {
+	fmt.Printf("DeleteICMPAllow called with SvcIP: %s, PodIP: %s\n", SvcIP, PodIP)
+	return nil
+}
+
+func (d *DummyProxyProcessor) CleanupICMPAllow(keep map[string]string) error {
+	fmt.Printf("CleanupICMPAllow called with %d entries\n", len(keep))
+	return nil
+}
+
 // Compile-time assertion that DummyProxyProcessor satisfies ProxyProcessor.
 var _ ProxyProcessor = (*DummyProxyProcessor)(nil)

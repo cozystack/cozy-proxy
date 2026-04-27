@@ -51,3 +51,25 @@ func TestWholeIPPassthrough(t *testing.T) {
 		})
 	}
 }
+
+func TestAllowICMP(t *testing.T) {
+	cases := []struct {
+		name   string
+		svc    *v1.Service
+		expect bool
+	}{
+		{"explicit true", svcWith(map[string]string{"networking.cozystack.io/allowICMP": "true"}), true},
+		{"explicit false", svcWith(map[string]string{"networking.cozystack.io/allowICMP": "false"}), false},
+		{"empty value", svcWith(map[string]string{"networking.cozystack.io/allowICMP": ""}), false},
+		{"absent annotation defaults to false", svcWith(map[string]string{}), false},
+		{"nil annotations defaults to false", &v1.Service{}, false},
+		{"unrelated annotation", svcWith(map[string]string{"networking.cozystack.io/wholeIP": "false"}), false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := allowICMP(c.svc); got != c.expect {
+				t.Errorf("allowICMP = %v, want %v", got, c.expect)
+			}
+		})
+	}
+}
