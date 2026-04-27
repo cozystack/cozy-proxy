@@ -7,6 +7,7 @@ import (
 	"net"
 
 	"github.com/google/nftables"
+	"github.com/google/nftables/binaryutil"
 	"github.com/google/nftables/expr"
 	"golang.org/x/sys/unix"
 	corev1 "k8s.io/api/core/v1"
@@ -215,6 +216,38 @@ func (p *NFTProxyProcessor) InitRules() error {
 		},
 	})
 	log.Info("Added early_snat rules (SNAT and DNAT)")
+
+	// --- port_filter rule: bypass for established/related ---
+	// Idiomatic stateful firewall: any packet that belongs to an existing
+	// conntrack flow bypasses the per-port drop below. Without this, egress
+	// traffic from VMs in PortList mode would be broken: their return packets
+	// arrive with daddr=LB IP and dport=ephemeral source port, which would
+	// otherwise match the drop rule below. Conntrack state is populated by
+	// the nf_conntrack subsystem independently of nftables chain priorities,
+	// so this works correctly at priority -350.
+	p.conn.AddRule(&nftables.Rule{
+		Table: p.table,
+		Chain: p.portFilterCh,
+		Exprs: []expr.Any{
+			// Load ct state into reg 1 (uint32 bitmask).
+			&expr.Ct{Register: 1, SourceRegister: false, Key: expr.CtKeySTATE},
+			// Mask with (ESTABLISHED | RELATED). If any bit set, accept.
+			&expr.Bitwise{
+				SourceRegister: 1,
+				DestRegister:   1,
+				Len:            4,
+				Mask:           binaryutil.NativeEndian.PutUint32(expr.CtStateBitESTABLISHED | expr.CtStateBitRELATED),
+				Xor:            binaryutil.NativeEndian.PutUint32(0),
+			},
+			&expr.Cmp{
+				Op:       expr.CmpOpNeq,
+				Register: 1,
+				Data:     []byte{0, 0, 0, 0},
+			},
+			&expr.Verdict{Kind: expr.VerdictAccept},
+		},
+	})
+	log.Info("Added port_filter ct established,related accept rule")
 
 	// --- port_filter rule ---
 	// Equivalent to:
