@@ -1,6 +1,10 @@
 package proxy
 
-import "fmt"
+import (
+	"fmt"
+
+	corev1 "k8s.io/api/core/v1"
+)
 
 type DummyProxyProcessor struct{}
 
@@ -23,3 +27,21 @@ func (d *DummyProxyProcessor) CleanupRules(KeepMap map[string]string) error {
 	fmt.Println("CleanupRules called with KeepMap:", KeepMap)
 	return nil
 }
+
+func (d *DummyProxyProcessor) EnsurePortFilter(SvcIP string, Ports []corev1.ServicePort) error {
+	fmt.Printf("EnsurePortFilter called with SvcIP: %s, Ports: %+v\n", SvcIP, Ports)
+	return nil
+}
+
+func (d *DummyProxyProcessor) DeletePortFilter(SvcIP string) error {
+	fmt.Printf("DeletePortFilter called with SvcIP: %s\n", SvcIP)
+	return nil
+}
+
+func (d *DummyProxyProcessor) CleanupPortFilters(keep map[string][]corev1.ServicePort) error {
+	fmt.Printf("CleanupPortFilters called with %d entries\n", len(keep))
+	return nil
+}
+
+// Compile-time assertion that DummyProxyProcessor satisfies ProxyProcessor.
+var _ ProxyProcessor = (*DummyProxyProcessor)(nil)
