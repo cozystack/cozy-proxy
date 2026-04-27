@@ -7,8 +7,10 @@ import (
 	"net"
 
 	"github.com/google/nftables"
+	"github.com/google/nftables/binaryutil"
 	"github.com/google/nftables/expr"
 	"golang.org/x/sys/unix"
+	corev1 "k8s.io/api/core/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
 )
 
@@ -21,9 +23,14 @@ type NFTProxyProcessor struct {
 	// Table "cozy_proxy" will contain all objects.
 	table *nftables.Table
 
-	// Sets and maps.
+	// IP-only NAT objects.
 	podSvcMap *nftables.Set // Map "pod_svc": maps pod IP → svc IP.
 	svcPodMap *nftables.Set // Map "svc_pod": maps svc IP → pod IP.
+
+	// Port-filtering objects (post-DNAT, key on pod IP).
+	filteredPods *nftables.Set   // set of pod IPs subject to port filtering.
+	allowedPorts *nftables.Set   // concat set: (ipv4_addr . inet_proto . inet_service).
+	portFilterCh *nftables.Chain // chain "port_filter" running post-conntrack and post-ingress_dnat.
 }
 
 // InitRules initializes the nftables configuration in a single table "cozy_proxy".
@@ -80,6 +87,44 @@ func (p *NFTProxyProcessor) InitRules() error {
 	}
 	log.Info("Created svc_pod map", "map", p.svcPodMap.Name)
 
+	// --- Port filter sets ---
+	// Set "filtered_pods": pod IPs subject to ingress port filtering.
+	// Keyed on pod IP because port_filter runs after ingress_dnat has rewritten
+	// daddr from LB IP to pod IP.
+	p.filteredPods = &nftables.Set{
+		Table:   p.table,
+		Name:    "filtered_pods",
+		KeyType: nftables.TypeIPAddr,
+	}
+	if err := p.conn.AddSet(p.filteredPods, nil); err != nil {
+		log.Error(err, "Could not add filtered_pods set")
+		return fmt.Errorf("could not add filtered_pods set: %v", err)
+	}
+	log.Info("Created filtered_pods set", "set", p.filteredPods.Name)
+
+	// Set "allowed_ports": concat key (ipv4_addr . inet_proto . inet_service).
+	// Each component is padded to a 4-byte slot, total 12 bytes.
+	allowedKeyType, err := nftables.ConcatSetType(
+		nftables.TypeIPAddr,
+		nftables.TypeInetProto,
+		nftables.TypeInetService,
+	)
+	if err != nil {
+		log.Error(err, "Could not build allowed_ports key type")
+		return fmt.Errorf("could not build allowed_ports key type: %v", err)
+	}
+	p.allowedPorts = &nftables.Set{
+		Table:         p.table,
+		Name:          "allowed_ports",
+		KeyType:       allowedKeyType,
+		Concatenation: true,
+	}
+	if err := p.conn.AddSet(p.allowedPorts, nil); err != nil {
+		log.Error(err, "Could not add allowed_ports set")
+		return fmt.Errorf("could not add allowed_ports set: %v", err)
+	}
+	log.Info("Created allowed_ports concat set", "set", p.allowedPorts.Name)
+
 	// --- Delete Chains ---
 	chains, _ := p.conn.ListChains()
 	for _, chain := range chains {
@@ -89,20 +134,34 @@ func (p *NFTProxyProcessor) InitRules() error {
 	}
 
 	// --- Create Chains ---
-	earlySNAT := p.conn.AddChain(&nftables.Chain{
-		Name:     "early_snat",
+	// port_filter runs at priority filter (0), AFTER conntrack (-200) and
+	// AFTER ingress_dnat (-150). At this priority, daddr has been rewritten
+	// from LB IP to pod IP by ingress_dnat, so the filter matches on pod IP.
+	// The "ct state established,related accept" rule below now works correctly
+	// because conntrack has tagged the packet by the time we evaluate it.
+	p.portFilterCh = p.conn.AddChain(&nftables.Chain{
+		Name:     "port_filter",
+		Table:    p.table,
+		Type:     nftables.ChainTypeFilter,
+		Hooknum:  nftables.ChainHookPrerouting,
+		Priority: nftables.ChainPriorityFilter,
+	})
+	log.Info("Created port_filter chain", "priority", "filter (0)")
+
+	egressSNAT := p.conn.AddChain(&nftables.Chain{
+		Name:     "egress_snat",
 		Table:    p.table,
 		Type:     nftables.ChainTypeFilter,
 		Hooknum:  nftables.ChainHookPrerouting,
 		Priority: nftables.ChainPriorityRaw,
 	})
-	log.Info("Created early_snat chain")
+	log.Info("Created egress_snat chain", "priority", "raw (-300)")
 
-	// --- Add Rules ---
-	// Add SNAT rule: ip saddr @pod ip saddr set ip saddr map @pod_svc
+	// SNAT rule: rewrite saddr from pod IP to svc IP (egress IP preservation).
+	// Runs BEFORE conntrack so the tracked tuple has saddr=LB_IP.
 	p.conn.AddRule(&nftables.Rule{
 		Table: p.table,
-		Chain: earlySNAT,
+		Chain: egressSNAT,
 		Exprs: []expr.Any{
 			&expr.Payload{
 				DestRegister: 1,
@@ -129,11 +188,23 @@ func (p *NFTProxyProcessor) InitRules() error {
 			},
 		},
 	})
+	log.Info("Added egress_snat saddr rewrite rule")
 
-	// Add DNAT rule: ip daddr @svc ip daddr set ip daddr map @svc_pod
+	ingressDNAT := p.conn.AddChain(&nftables.Chain{
+		Name:     "ingress_dnat",
+		Table:    p.table,
+		Type:     nftables.ChainTypeFilter,
+		Hooknum:  nftables.ChainHookPrerouting,
+		Priority: nftables.ChainPriorityMangle,
+	})
+	log.Info("Created ingress_dnat chain", "priority", "mangle (-150)")
+
+	// DNAT rule: rewrite daddr from svc IP to pod IP. Runs AFTER conntrack
+	// so conntrack records the original daddr=LB_IP and can correctly match
+	// reply packets of egress flows.
 	p.conn.AddRule(&nftables.Rule{
 		Table: p.table,
-		Chain: earlySNAT,
+		Chain: ingressDNAT,
 		Exprs: []expr.Any{
 			&expr.Payload{
 				DestRegister: 1,
@@ -160,7 +231,96 @@ func (p *NFTProxyProcessor) InitRules() error {
 			},
 		},
 	})
-	log.Info("Added early_snat rules (SNAT and DNAT)")
+	log.Info("Added ingress_dnat daddr rewrite rule")
+
+	// --- port_filter rule: bypass for established/related ---
+	// Idiomatic stateful firewall: any packet that belongs to an existing
+	// conntrack flow bypasses the per-port drop below. Without this, egress
+	// traffic from VMs in PortList mode would be broken: their return packets
+	// arrive with daddr=LB IP and dport=ephemeral source port, which would
+	// otherwise match the drop rule below. Because port_filter runs at
+	// priority filter (0), conntrack (priority -200) has already evaluated
+	// the packet and ct state is correctly populated.
+	p.conn.AddRule(&nftables.Rule{
+		Table: p.table,
+		Chain: p.portFilterCh,
+		Exprs: []expr.Any{
+			// Load ct state into reg 1 (uint32 bitmask).
+			&expr.Ct{Register: 1, SourceRegister: false, Key: expr.CtKeySTATE},
+			// Mask with (ESTABLISHED | RELATED). If any bit set, accept.
+			&expr.Bitwise{
+				SourceRegister: 1,
+				DestRegister:   1,
+				Len:            4,
+				Mask:           binaryutil.NativeEndian.PutUint32(expr.CtStateBitESTABLISHED | expr.CtStateBitRELATED),
+				Xor:            binaryutil.NativeEndian.PutUint32(0),
+			},
+			&expr.Cmp{
+				Op:       expr.CmpOpNeq,
+				Register: 1,
+				Data:     []byte{0, 0, 0, 0},
+			},
+			&expr.Verdict{Kind: expr.VerdictAccept},
+		},
+	})
+	log.Info("Added port_filter ct established,related accept rule")
+
+	// --- port_filter rule ---
+	// Equivalent to:
+	//   ip daddr @filtered_pods ip daddr . meta l4proto . th dport != @allowed_ports drop
+	//
+	// At priority filter (0), daddr has been rewritten by ingress_dnat from
+	// the LB IP to the pod IP. Both the gate set (filtered_pods) and the
+	// allowed_ports composite key are therefore keyed on pod IP.
+	//
+	// Implementation: lay out the 12-byte concat key across NFT_REG32_00..02
+	// (register IDs 8, 9, 10), then a single inverted lookup against
+	// allowed_ports. Lookup reads s.KeyType.Bytes (12) bytes starting at the
+	// source register, so the three 4-byte slots must be contiguous.
+	p.conn.AddRule(&nftables.Rule{
+		Table: p.table,
+		Chain: p.portFilterCh,
+		Exprs: []expr.Any{
+			// 1. Gate: ip daddr in filtered_pods (continue if matched).
+			&expr.Payload{
+				DestRegister: 1,
+				Base:         expr.PayloadBaseNetworkHeader,
+				Offset:       16, // IPv4 daddr (post-ingress_dnat: pod IP)
+				Len:          4,
+			},
+			&expr.Lookup{
+				SourceRegister: 1,
+				SetName:        p.filteredPods.Name,
+				SetID:          p.filteredPods.ID,
+			},
+			// 2. Build composite key (daddr . l4proto . dport) into reg32_00..02.
+			&expr.Payload{
+				DestRegister: unix.NFT_REG32_00,
+				Base:         expr.PayloadBaseNetworkHeader,
+				Offset:       16,
+				Len:          4,
+			},
+			&expr.Meta{
+				Key:      expr.MetaKeyL4PROTO,
+				Register: unix.NFT_REG32_01,
+			},
+			&expr.Payload{
+				DestRegister: unix.NFT_REG32_02,
+				Base:         expr.PayloadBaseTransportHeader,
+				Offset:       2, // dport (TCP and UDP both at byte 2)
+				Len:          2,
+			},
+			// 3. If (daddr, proto, dport) NOT in allowed_ports → drop.
+			&expr.Lookup{
+				SourceRegister: unix.NFT_REG32_00,
+				SetName:        p.allowedPorts.Name,
+				SetID:          p.allowedPorts.ID,
+				Invert:         true,
+			},
+			&expr.Verdict{Kind: expr.VerdictDrop},
+		},
+	})
+	log.Info("Added port_filter drop rule")
 
 	// Commit all changes.
 	if err := p.conn.Flush(); err != nil {
@@ -408,3 +568,242 @@ func (p *NFTProxyProcessor) CleanupRules(keepMap map[string]string) error {
 	log.Info("CleanupRules completed successfully")
 	return nil
 }
+
+// EnsurePortFilter installs ingress port filtering rules for the given
+// (svcIP, podIP) pair. The actual nft set keys are pod IPs, because the
+// port_filter chain runs at priority filter (0), after ingress_dnat has
+// rewritten daddr from svcIP to podIP. The given ports are the only ones
+// permitted on the post-DNAT pod IP; all other traffic destined to that
+// pod IP is dropped. Idempotent.
+func (p *NFTProxyProcessor) EnsurePortFilter(svcIP, podIP string, ports []corev1.ServicePort) error {
+	// Empty ports list is documented as equivalent to DeletePortFilter:
+	// the caller wants to disable filtering for this pod entirely. Without
+	// this short-circuit we would add the pod to filtered_pods with no
+	// matching allowed_ports entries, which would drop every ingress packet
+	// to the pod IP — the opposite of "no filter".
+	if len(ports) == 0 {
+		return p.DeletePortFilter(svcIP, podIP)
+	}
+	log.Info("Ensuring port filter", "svcIP", svcIP, "podIP", podIP, "portCount", len(ports))
+
+	parsedPodIP := net.ParseIP(podIP).To4()
+	if parsedPodIP == nil {
+		return fmt.Errorf("invalid podIP: %s", podIP)
+	}
+
+	// 1. Remove any pre-existing entries in allowed_ports for podIP so we can
+	// rebuild the tuple set cleanly (idempotent).
+	if err := p.removeAllowedPortsForPod(parsedPodIP); err != nil {
+		return err
+	}
+
+	// 2. Add podIP to filtered_pods (idempotent — Add ignores duplicates).
+	if err := p.conn.SetAddElements(p.filteredPods, []nftables.SetElement{{Key: parsedPodIP}}); err != nil {
+		return fmt.Errorf("failed to add %s to filtered_pods: %v", podIP, err)
+	}
+
+	// 3. Accumulate allowed (podIP, proto, port) tuples and add them in a single batch.
+	var elements []nftables.SetElement
+	for _, sp := range ports {
+		var protoByte byte
+		switch sp.Protocol {
+		case corev1.ProtocolTCP, "":
+			protoByte = unix.IPPROTO_TCP
+		case corev1.ProtocolUDP:
+			protoByte = unix.IPPROTO_UDP
+		default:
+			log.Info("Skipping unsupported protocol for port filter",
+				"podIP", podIP, "protocol", sp.Protocol)
+			continue
+		}
+		elements = append(elements, nftables.SetElement{Key: concatPortKey(parsedPodIP, protoByte, uint16(sp.Port))})
+	}
+	if len(elements) > 0 {
+		if err := p.conn.SetAddElements(p.allowedPorts, elements); err != nil {
+			return fmt.Errorf("failed to add port tuples to allowed_ports for pod %s: %v", podIP, err)
+		}
+	}
+
+	if err := p.conn.Flush(); err != nil {
+		return fmt.Errorf("failed to flush EnsurePortFilter: %v", err)
+	}
+	log.Info("Port filter ensured", "svcIP", svcIP, "podIP", podIP, "ports", ports)
+	return nil
+}
+
+// DeletePortFilter removes podIP from filtered_pods and clears any allowed
+// port entries for it. svcIP is used only for logging context. Tolerates
+// ENOENT for clean idempotency.
+func (p *NFTProxyProcessor) DeletePortFilter(svcIP, podIP string) error {
+	log.Info("Deleting port filter", "svcIP", svcIP, "podIP", podIP)
+	parsedPodIP := net.ParseIP(podIP).To4()
+	if parsedPodIP == nil {
+		return fmt.Errorf("invalid podIP: %s", podIP)
+	}
+	if err := p.removeAllowedPortsForPod(parsedPodIP); err != nil {
+		return err
+	}
+	if err := p.conn.SetDeleteElements(p.filteredPods, []nftables.SetElement{{Key: parsedPodIP}}); err != nil {
+		if !errors.Is(err, unix.ENOENT) {
+			return fmt.Errorf("failed to delete %s from filtered_pods: %v", podIP, err)
+		}
+	}
+	if err := p.conn.Flush(); err != nil {
+		if errors.Is(err, unix.ENOENT) {
+			log.Info("DeletePortFilter ENOENT on flush — already gone", "podIP", podIP)
+			return nil
+		}
+		return fmt.Errorf("failed to flush DeletePortFilter: %v", err)
+	}
+	log.Info("Port filter deleted", "svcIP", svcIP, "podIP", podIP)
+	return nil
+}
+
+// CleanupPortFilters reconciles port_filter state with the desired snapshot.
+// The keep map is keyed by svcIP (for caller convenience) but the on-disk
+// nft set keys are pod IPs. The implementation is a single-pass diff: it
+// fetches current state once, computes additions and removals in memory,
+// batches SetAddElements / SetDeleteElements per set, and Flushes exactly
+// once.
+func (p *NFTProxyProcessor) CleanupPortFilters(keep map[string]PortFilterEntry) error {
+	log.Info("Starting CleanupPortFilters", "keepCount", len(keep))
+
+	// 1. Build desired state in memory.
+	desiredPods := make(map[string]bool, len(keep))
+	desiredPortKeys := make(map[string][]byte) // hex(key) → key (byte slice)
+	for _, entry := range keep {
+		parsedPodIP := net.ParseIP(entry.PodIP).To4()
+		if parsedPodIP == nil {
+			log.Info("Skipping invalid podIP in cleanup keep map", "podIP", entry.PodIP)
+			continue
+		}
+		desiredPods[entry.PodIP] = true
+		for _, sp := range entry.Ports {
+			var protoByte byte
+			switch sp.Protocol {
+			case corev1.ProtocolTCP, "":
+				protoByte = unix.IPPROTO_TCP
+			case corev1.ProtocolUDP:
+				protoByte = unix.IPPROTO_UDP
+			default:
+				continue
+			}
+			key := concatPortKey(parsedPodIP, protoByte, uint16(sp.Port))
+			desiredPortKeys[fmt.Sprintf("%x", key)] = key
+		}
+	}
+
+	// 2. Fetch current state.
+	currentPods, err := p.conn.GetSetElements(p.filteredPods)
+	if err != nil {
+		return fmt.Errorf("failed to list filtered_pods: %v", err)
+	}
+	currentPorts, err := p.conn.GetSetElements(p.allowedPorts)
+	if err != nil {
+		return fmt.Errorf("failed to list allowed_ports: %v", err)
+	}
+
+	// 3. Compute additions / removals.
+	var addPods, delPods []nftables.SetElement
+	var addPorts, delPorts []nftables.SetElement
+	seenPods := make(map[string]bool, len(currentPods))
+	for _, el := range currentPods {
+		ipStr := net.IP(el.Key).String()
+		seenPods[ipStr] = true
+		if !desiredPods[ipStr] {
+			delPods = append(delPods, nftables.SetElement{Key: el.Key})
+		}
+	}
+	for podIPStr := range desiredPods {
+		if !seenPods[podIPStr] {
+			parsed := net.ParseIP(podIPStr).To4()
+			if parsed == nil {
+				continue
+			}
+			addPods = append(addPods, nftables.SetElement{Key: parsed})
+		}
+	}
+	seenPorts := make(map[string]bool, len(currentPorts))
+	for _, el := range currentPorts {
+		keyHex := fmt.Sprintf("%x", el.Key)
+		seenPorts[keyHex] = true
+		if _, want := desiredPortKeys[keyHex]; !want {
+			delPorts = append(delPorts, nftables.SetElement{Key: el.Key})
+		}
+	}
+	for keyHex, key := range desiredPortKeys {
+		if !seenPorts[keyHex] {
+			addPorts = append(addPorts, nftables.SetElement{Key: key})
+		}
+	}
+
+	// 4. Batch ops.
+	if len(delPods) > 0 {
+		if err := p.conn.SetDeleteElements(p.filteredPods, delPods); err != nil {
+			return fmt.Errorf("failed to delete stale filtered_pods: %v", err)
+		}
+	}
+	if len(delPorts) > 0 {
+		if err := p.conn.SetDeleteElements(p.allowedPorts, delPorts); err != nil {
+			return fmt.Errorf("failed to delete stale allowed_ports: %v", err)
+		}
+	}
+	if len(addPods) > 0 {
+		if err := p.conn.SetAddElements(p.filteredPods, addPods); err != nil {
+			return fmt.Errorf("failed to add filtered_pods: %v", err)
+		}
+	}
+	if len(addPorts) > 0 {
+		if err := p.conn.SetAddElements(p.allowedPorts, addPorts); err != nil {
+			return fmt.Errorf("failed to add allowed_ports: %v", err)
+		}
+	}
+
+	// 5. Single flush.
+	if err := p.conn.Flush(); err != nil {
+		return fmt.Errorf("failed to flush CleanupPortFilters: %v", err)
+	}
+	log.Info("CleanupPortFilters completed",
+		"addedPods", len(addPods), "removedPods", len(delPods),
+		"addedPorts", len(addPorts), "removedPorts", len(delPorts))
+	return nil
+}
+
+// concatPortKey returns the bytes for a (ipv4 . proto . port) concat set key.
+// nftables packs each component to 4-byte-aligned slots: 4 + 4 + 4 = 12 bytes.
+// proto goes in the low byte of slot 1, port goes in the first 2 bytes
+// (big-endian) of slot 2.
+func concatPortKey(ipv4 net.IP, proto byte, port uint16) []byte {
+	key := make([]byte, 12)
+	copy(key[0:4], ipv4.To4())
+	key[4] = proto
+	// bytes 5,6,7 stay zero (padding)
+	key[8] = byte(port >> 8)
+	key[9] = byte(port & 0xff)
+	// bytes 10,11 stay zero (padding)
+	return key
+}
+
+// removeAllowedPortsForPod deletes all allowed_ports entries whose key prefix
+// matches parsedPodIP. Used to make EnsurePortFilter idempotent.
+func (p *NFTProxyProcessor) removeAllowedPortsForPod(parsedPodIP net.IP) error {
+	elems, err := p.conn.GetSetElements(p.allowedPorts)
+	if err != nil {
+		return fmt.Errorf("failed to list allowed_ports: %v", err)
+	}
+	var toDel []nftables.SetElement
+	for _, el := range elems {
+		if len(el.Key) >= 4 && bytes.Equal(el.Key[:4], parsedPodIP.To4()) {
+			toDel = append(toDel, nftables.SetElement{Key: el.Key})
+		}
+	}
+	if len(toDel) > 0 {
+		if err := p.conn.SetDeleteElements(p.allowedPorts, toDel); err != nil {
+			return fmt.Errorf("failed to delete stale allowed_ports for pod: %v", err)
+		}
+	}
+	return nil
+}
+
+// Compile-time assertion that NFTProxyProcessor satisfies ProxyProcessor.
+var _ ProxyProcessor = (*NFTProxyProcessor)(nil)
