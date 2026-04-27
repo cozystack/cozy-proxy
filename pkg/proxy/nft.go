@@ -594,7 +594,8 @@ func (p *NFTProxyProcessor) EnsurePortFilter(svcIP, podIP string, ports []corev1
 		return fmt.Errorf("failed to add %s to filtered_pods: %v", podIP, err)
 	}
 
-	// 3. Add allowed (podIP, proto, port) tuples.
+	// 3. Accumulate allowed (podIP, proto, port) tuples and add them in a single batch.
+	var elements []nftables.SetElement
 	for _, sp := range ports {
 		var protoByte byte
 		switch sp.Protocol {
@@ -607,10 +608,11 @@ func (p *NFTProxyProcessor) EnsurePortFilter(svcIP, podIP string, ports []corev1
 				"podIP", podIP, "protocol", sp.Protocol)
 			continue
 		}
-		key := concatPortKey(parsedPodIP, protoByte, uint16(sp.Port))
-		if err := p.conn.SetAddElements(p.allowedPorts, []nftables.SetElement{{Key: key}}); err != nil {
-			return fmt.Errorf("failed to add port tuple to allowed_ports (pod=%s proto=%v port=%d): %v",
-				podIP, sp.Protocol, sp.Port, err)
+		elements = append(elements, nftables.SetElement{Key: concatPortKey(parsedPodIP, protoByte, uint16(sp.Port))})
+	}
+	if len(elements) > 0 {
+		if err := p.conn.SetAddElements(p.allowedPorts, elements); err != nil {
+			return fmt.Errorf("failed to add port tuples to allowed_ports for pod %s: %v", podIP, err)
 		}
 	}
 
@@ -651,35 +653,111 @@ func (p *NFTProxyProcessor) DeletePortFilter(svcIP, podIP string) error {
 
 // CleanupPortFilters reconciles port_filter state with the desired snapshot.
 // The keep map is keyed by svcIP (for caller convenience) but the on-disk
-// nft set keys are pod IPs. We remove any pod IP currently in filtered_pods
-// that is not desired, then re-Ensure the desired ones.
+// nft set keys are pod IPs. The implementation is a single-pass diff: it
+// fetches current state once, computes additions and removals in memory,
+// batches SetAddElements / SetDeleteElements per set, and Flushes exactly
+// once.
 func (p *NFTProxyProcessor) CleanupPortFilters(keep map[string]PortFilterEntry) error {
 	log.Info("Starting CleanupPortFilters", "keepCount", len(keep))
 
-	desired := make(map[string]bool, len(keep))
+	// 1. Build desired state in memory.
+	desiredPods := make(map[string]bool, len(keep))
+	desiredPortKeys := make(map[string][]byte) // hex(key) → key (byte slice)
 	for _, entry := range keep {
-		desired[entry.PodIP] = true
+		parsedPodIP := net.ParseIP(entry.PodIP).To4()
+		if parsedPodIP == nil {
+			log.Info("Skipping invalid podIP in cleanup keep map", "podIP", entry.PodIP)
+			continue
+		}
+		desiredPods[entry.PodIP] = true
+		for _, sp := range entry.Ports {
+			var protoByte byte
+			switch sp.Protocol {
+			case corev1.ProtocolTCP, "":
+				protoByte = unix.IPPROTO_TCP
+			case corev1.ProtocolUDP:
+				protoByte = unix.IPPROTO_UDP
+			default:
+				continue
+			}
+			key := concatPortKey(parsedPodIP, protoByte, uint16(sp.Port))
+			desiredPortKeys[fmt.Sprintf("%x", key)] = key
+		}
 	}
 
-	current, err := p.conn.GetSetElements(p.filteredPods)
+	// 2. Fetch current state.
+	currentPods, err := p.conn.GetSetElements(p.filteredPods)
 	if err != nil {
 		return fmt.Errorf("failed to list filtered_pods: %v", err)
 	}
-	for _, el := range current {
+	currentPorts, err := p.conn.GetSetElements(p.allowedPorts)
+	if err != nil {
+		return fmt.Errorf("failed to list allowed_ports: %v", err)
+	}
+
+	// 3. Compute additions / removals.
+	var addPods, delPods []nftables.SetElement
+	var addPorts, delPorts []nftables.SetElement
+	seenPods := make(map[string]bool, len(currentPods))
+	for _, el := range currentPods {
 		ipStr := net.IP(el.Key).String()
-		if !desired[ipStr] {
-			log.Info("Removing stale filtered_pod", "podIP", ipStr)
-			// We don't have the original svcIP in current state; pass empty.
-			if err := p.DeletePortFilter("", ipStr); err != nil {
-				return fmt.Errorf("cleanup delete pod %s: %v", ipStr, err)
+		seenPods[ipStr] = true
+		if !desiredPods[ipStr] {
+			delPods = append(delPods, nftables.SetElement{Key: el.Key})
+		}
+	}
+	for podIPStr := range desiredPods {
+		if !seenPods[podIPStr] {
+			parsed := net.ParseIP(podIPStr).To4()
+			if parsed == nil {
+				continue
 			}
+			addPods = append(addPods, nftables.SetElement{Key: parsed})
 		}
 	}
-	for svcIP, entry := range keep {
-		if err := p.EnsurePortFilter(svcIP, entry.PodIP, entry.Ports); err != nil {
-			return fmt.Errorf("cleanup ensure %s: %v", svcIP, err)
+	seenPorts := make(map[string]bool, len(currentPorts))
+	for _, el := range currentPorts {
+		keyHex := fmt.Sprintf("%x", el.Key)
+		seenPorts[keyHex] = true
+		if _, want := desiredPortKeys[keyHex]; !want {
+			delPorts = append(delPorts, nftables.SetElement{Key: el.Key})
 		}
 	}
+	for keyHex, key := range desiredPortKeys {
+		if !seenPorts[keyHex] {
+			addPorts = append(addPorts, nftables.SetElement{Key: key})
+		}
+	}
+
+	// 4. Batch ops.
+	if len(delPods) > 0 {
+		if err := p.conn.SetDeleteElements(p.filteredPods, delPods); err != nil {
+			return fmt.Errorf("failed to delete stale filtered_pods: %v", err)
+		}
+	}
+	if len(delPorts) > 0 {
+		if err := p.conn.SetDeleteElements(p.allowedPorts, delPorts); err != nil {
+			return fmt.Errorf("failed to delete stale allowed_ports: %v", err)
+		}
+	}
+	if len(addPods) > 0 {
+		if err := p.conn.SetAddElements(p.filteredPods, addPods); err != nil {
+			return fmt.Errorf("failed to add filtered_pods: %v", err)
+		}
+	}
+	if len(addPorts) > 0 {
+		if err := p.conn.SetAddElements(p.allowedPorts, addPorts); err != nil {
+			return fmt.Errorf("failed to add allowed_ports: %v", err)
+		}
+	}
+
+	// 5. Single flush.
+	if err := p.conn.Flush(); err != nil {
+		return fmt.Errorf("failed to flush CleanupPortFilters: %v", err)
+	}
+	log.Info("CleanupPortFilters completed",
+		"addedPods", len(addPods), "removedPods", len(delPods),
+		"addedPorts", len(addPorts), "removedPorts", len(delPorts))
 	return nil
 }
 
