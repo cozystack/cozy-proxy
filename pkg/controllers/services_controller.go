@@ -383,10 +383,19 @@ func (c *ServicesController) addEndpointFunc(obj interface{}) {
 
 	// If both the Service and the Endpoint have valid IPs, ensure NAT mapping rules.
 	if hasValidServiceIP(se.Service) && hasValidEndpointIP(ep) {
-		c.Proxy.EnsureRules(
-			se.Service.Status.LoadBalancer.Ingress[0].IP,
-			ep.Subsets[0].Addresses[0].IP,
-		)
+		svcIP := se.Service.Status.LoadBalancer.Ingress[0].IP
+		podIP := ep.Subsets[0].Addresses[0].IP
+		c.Proxy.EnsureRules(svcIP, podIP)
+		// Mirror the port-filter state to the new endpoint.
+		if wholeIPPassthrough(se.Service) {
+			if err := c.Proxy.DeletePortFilter(svcIP, podIP); err != nil {
+				log.Error(err, "failed to delete port filter on endpoint add", "svcIP", svcIP, "podIP", podIP)
+			}
+		} else {
+			if err := c.Proxy.EnsurePortFilter(svcIP, podIP, se.Service.Spec.Ports); err != nil {
+				log.Error(err, "failed to ensure port filter on endpoint add", "svcIP", svcIP, "podIP", podIP)
+			}
+		}
 	}
 }
 
@@ -406,7 +415,12 @@ func (c *ServicesController) deleteEndpointFunc(obj interface{}) {
 	if !hasValidServiceIP(se.Service) || !hasValidEndpointIP(se.Endpoint) {
 		return
 	}
-	c.Proxy.DeleteRules(se.Service.Status.LoadBalancer.Ingress[0].IP, se.Endpoint.Subsets[0].Addresses[0].IP)
+	svcIP := se.Service.Status.LoadBalancer.Ingress[0].IP
+	podIP := se.Endpoint.Subsets[0].Addresses[0].IP
+	if err := c.Proxy.DeletePortFilter(svcIP, podIP); err != nil {
+		log.Error(err, "failed to delete port filter on endpoint delete", "svcIP", svcIP, "podIP", podIP)
+	}
+	c.Proxy.DeleteRules(svcIP, podIP)
 	// Set the endpoint to nil.
 	c.Services.SetEndpoint(ep.Namespace, ep.Name, nil)
 }
@@ -426,7 +440,12 @@ func (c *ServicesController) updateEndpointFunc(oldObj, newObj interface{}) {
 	}
 	if !hasValidEndpointIP(ep) {
 		if hasValidServiceIP(se.Service) && hasValidEndpointIP(se.Endpoint) {
-			c.Proxy.DeleteRules(se.Service.Status.LoadBalancer.Ingress[0].IP, se.Endpoint.Subsets[0].Addresses[0].IP)
+			svcIP := se.Service.Status.LoadBalancer.Ingress[0].IP
+			oldPodIP := se.Endpoint.Subsets[0].Addresses[0].IP
+			if err := c.Proxy.DeletePortFilter(svcIP, oldPodIP); err != nil {
+				log.Error(err, "failed to delete port filter on endpoint invalidation", "svcIP", svcIP, "podIP", oldPodIP)
+			}
+			c.Proxy.DeleteRules(svcIP, oldPodIP)
 		}
 		c.Services.SetEndpoint(ep.Namespace, ep.Name, ep)
 		return
@@ -437,7 +456,18 @@ func (c *ServicesController) updateEndpointFunc(oldObj, newObj interface{}) {
 	if !hasValidEndpointIP(ep) {
 		return
 	}
-	c.Proxy.EnsureRules(se.Service.Status.LoadBalancer.Ingress[0].IP, ep.Subsets[0].Addresses[0].IP)
+	svcIP := se.Service.Status.LoadBalancer.Ingress[0].IP
+	podIP := ep.Subsets[0].Addresses[0].IP
+	c.Proxy.EnsureRules(svcIP, podIP)
+	if wholeIPPassthrough(se.Service) {
+		if err := c.Proxy.DeletePortFilter(svcIP, podIP); err != nil {
+			log.Error(err, "failed to delete port filter on endpoint update", "svcIP", svcIP, "podIP", podIP)
+		}
+	} else {
+		if err := c.Proxy.EnsurePortFilter(svcIP, podIP, se.Service.Spec.Ports); err != nil {
+			log.Error(err, "failed to ensure port filter on endpoint update", "svcIP", svcIP, "podIP", podIP)
+		}
+	}
 	c.Services.SetEndpoint(ep.Namespace, ep.Name, ep)
 }
 
