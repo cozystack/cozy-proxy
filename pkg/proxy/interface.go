@@ -11,7 +11,7 @@ type ProxyProcessor interface {
 	// EnsurePortFilter installs (or replaces) ingress port-filtering rules
 	// for the given pod IP. Only TCP/UDP traffic destined to one of the
 	// listed ports (in the post-DNAT pod IP) will be accepted; any other
-	// port is dropped after the early_snat rewrite. Pass an empty ports
+	// port is dropped after the ingress_dnat rewrite. Pass an empty ports
 	// slice to disable filtering for the (svcIP, podIP) pair (equivalent
 	// to DeletePortFilter).
 	EnsurePortFilter(SvcIP, PodIP string, Ports []corev1.ServicePort) error

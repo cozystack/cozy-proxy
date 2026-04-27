@@ -30,7 +30,7 @@ type NFTProxyProcessor struct {
 	// Port-filtering objects (post-DNAT, key on pod IP).
 	filteredPods *nftables.Set   // set of pod IPs subject to port filtering.
 	allowedPorts *nftables.Set   // concat set: (ipv4_addr . inet_proto . inet_service).
-	portFilterCh *nftables.Chain // chain "port_filter" running post-conntrack and post-early_snat.
+	portFilterCh *nftables.Chain // chain "port_filter" running post-conntrack and post-ingress_dnat.
 }
 
 // InitRules initializes the nftables configuration in a single table "cozy_proxy".
@@ -89,7 +89,7 @@ func (p *NFTProxyProcessor) InitRules() error {
 
 	// --- Port filter sets ---
 	// Set "filtered_pods": pod IPs subject to ingress port filtering.
-	// Keyed on pod IP because port_filter runs after early_snat has rewritten
+	// Keyed on pod IP because port_filter runs after ingress_dnat has rewritten
 	// daddr from LB IP to pod IP.
 	p.filteredPods = &nftables.Set{
 		Table:   p.table,
@@ -134,10 +134,10 @@ func (p *NFTProxyProcessor) InitRules() error {
 	}
 
 	// --- Create Chains ---
-	// port_filter runs at priority filter (0), AFTER early_snat (-300) and
-	// AFTER conntrack (-200). At this priority, daddr has been rewritten from
-	// LB IP to pod IP by early_snat, so the filter matches on pod IP. The
-	// "ct state established,related accept" rule below now works correctly
+	// port_filter runs at priority filter (0), AFTER conntrack (-200) and
+	// AFTER ingress_dnat (-150). At this priority, daddr has been rewritten
+	// from LB IP to pod IP by ingress_dnat, so the filter matches on pod IP.
+	// The "ct state established,related accept" rule below now works correctly
 	// because conntrack has tagged the packet by the time we evaluate it.
 	p.portFilterCh = p.conn.AddChain(&nftables.Chain{
 		Name:     "port_filter",
@@ -269,8 +269,8 @@ func (p *NFTProxyProcessor) InitRules() error {
 	// Equivalent to:
 	//   ip daddr @filtered_pods ip daddr . meta l4proto . th dport != @allowed_ports drop
 	//
-	// At priority filter (0), daddr has been rewritten by early_snat from the
-	// LB IP to the pod IP. Both the gate set (filtered_pods) and the
+	// At priority filter (0), daddr has been rewritten by ingress_dnat from
+	// the LB IP to the pod IP. Both the gate set (filtered_pods) and the
 	// allowed_ports composite key are therefore keyed on pod IP.
 	//
 	// Implementation: lay out the 12-byte concat key across NFT_REG32_00..02
@@ -285,7 +285,7 @@ func (p *NFTProxyProcessor) InitRules() error {
 			&expr.Payload{
 				DestRegister: 1,
 				Base:         expr.PayloadBaseNetworkHeader,
-				Offset:       16, // IPv4 daddr (post-early_snat: pod IP)
+				Offset:       16, // IPv4 daddr (post-ingress_dnat: pod IP)
 				Len:          4,
 			},
 			&expr.Lookup{
@@ -571,7 +571,7 @@ func (p *NFTProxyProcessor) CleanupRules(keepMap map[string]string) error {
 
 // EnsurePortFilter installs ingress port filtering rules for the given
 // (svcIP, podIP) pair. The actual nft set keys are pod IPs, because the
-// port_filter chain runs at priority filter (0), after early_snat has
+// port_filter chain runs at priority filter (0), after ingress_dnat has
 // rewritten daddr from svcIP to podIP. The given ports are the only ones
 // permitted on the post-DNAT pod IP; all other traffic destined to that
 // pod IP is dropped. Idempotent.
