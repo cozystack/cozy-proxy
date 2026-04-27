@@ -210,7 +210,7 @@ func (c *ServicesController) addServiceFunc(obj interface{}) {
 		// Object is not a Service.
 		return
 	}
-	if !hasWholeIPAnnotation(svc) {
+	if !isCozyProxyService(svc) {
 		return
 	}
 
@@ -272,8 +272,8 @@ func (c *ServicesController) updateServiceFunc(oldObj, newObj interface{}) {
 		return
 	}
 
-	// If the required annotation is missing, remove the service mapping and delete NAT rules if applicable.
-	if !hasWholeIPAnnotation(svc) {
+	// If the service no longer matches our selection criteria, remove the service mapping and delete NAT rules if applicable.
+	if !isCozyProxyService(svc) {
 		if se, exists := c.Services.Get(svc.Namespace, svc.Name); exists {
 			if hasValidServiceIP(se.Service) && hasValidEndpointIP(se.Endpoint) {
 				svcIP := se.Service.Status.LoadBalancer.Ingress[0].IP
@@ -465,11 +465,35 @@ func hasValidEndpointIP(ep *v1.Endpoints) bool {
 const (
 	wholeIPAnnotation   = "networking.cozystack.io/wholeIP"
 	allowICMPAnnotation = "networking.cozystack.io/allowICMP"
+
+	// serviceProxyNameLabel is the standard Kubernetes label used to delegate
+	// a service to a non-default proxy implementation; kube-proxy skips
+	// services carrying it.
+	serviceProxyNameLabel = "service.kubernetes.io/service-proxy-name"
+
+	// serviceProxyName is the value cozy-proxy matches in serviceProxyNameLabel.
+	serviceProxyName = "cozy-proxy"
 )
 
-// hasWholeIPAnnotation reports whether the service is opted into cozy-proxy
-// management via the wholeIP annotation. Any value triggers management — the
-// value's meaning (passthrough vs port-filter) is determined by wholeIPPassthrough.
+// isCozyProxyService reports whether the service should be managed by cozy-proxy.
+// A service is selected if it carries the
+// service.kubernetes.io/service-proxy-name=cozy-proxy label (standard
+// Kubernetes mechanism, also tells kube-proxy to ignore the service) or the
+// networking.cozystack.io/wholeIP annotation (any value — the value drives
+// passthrough vs port-filter mode, see wholeIPPassthrough).
+func isCozyProxyService(svc *v1.Service) bool {
+	if svc == nil {
+		return false
+	}
+	if svc.Labels[serviceProxyNameLabel] == serviceProxyName {
+		return true
+	}
+	return hasWholeIPAnnotation(svc)
+}
+
+// hasWholeIPAnnotation reports whether the service carries the wholeIP
+// annotation. Any value is accepted; the value's meaning (passthrough vs
+// port-filter) is determined by wholeIPPassthrough.
 func hasWholeIPAnnotation(svc *v1.Service) bool {
 	if svc == nil {
 		return false
@@ -479,9 +503,9 @@ func hasWholeIPAnnotation(svc *v1.Service) bool {
 }
 
 // wholeIPPassthrough reports whether ingress traffic should bypass port
-// filtering. Defaults to true (current behavior) for any value other than
-// the explicit string "false", preserving backward compatibility for services
-// rendered by older charts (annotation: "true") and services with no value.
+// filtering. Defaults to true for any value other than the explicit string
+// "false", so services selected by label alone (no annotation) and services
+// with annotation: "true" both behave as passthrough.
 func wholeIPPassthrough(svc *v1.Service) bool {
 	if svc == nil || svc.Annotations == nil {
 		return true
