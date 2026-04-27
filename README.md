@@ -17,13 +17,45 @@ The last option is the simplest and most flexible, but it has a limitation: Kube
 but only traffic on specific ports (see: [Kubernetes Issue #23864](https://github.com/kubernetes/kubernetes/issues/23864)).
 Additionally, kube-proxy does not perform SNAT, which causes outgoing traffic from the pod to use the default gateway of the host where it is running.
 
-To address these issues, we have added an additional controller that performs 1:1 NAT for services annotated with `networking.cozystack.io/wholeIP=true`.
+To address these issues, we have added an additional controller that performs 1:1 NAT for services annotated with `networking.cozystack.io/wholeIP`.
 
 ## How It Works
 
-cozy-proxy is a simple Kubernetes controller that watches for services with the `networking.cozystack.io/wholeIP=true` annotation. When it finds such a service, it creates an NFT rule that forwards all traffic from the service's external IP to the pod's IP and vice versa. It also disables connection tracking (conntrack) for traffic between the service and the pod, offloading that work to NFTables.
+cozy-proxy is a simple Kubernetes controller that watches for services with the `networking.cozystack.io/wholeIP` annotation. When it finds such a service, it creates an NFT rule that forwards traffic from the service's external IP to the pod's IP and vice versa, performing source-IP preservation for egress traffic.
 
 This controller can be used together with kube-proxy and Cilium in kube-proxy replacement mode.
+
+## Service annotations
+
+cozy-proxy reacts to Services that carry the `networking.cozystack.io/wholeIP`
+annotation. The annotation value selects the ingress mode:
+
+| Value     | Behavior                                                                                                        |
+|-----------|-----------------------------------------------------------------------------------------------------------------|
+| `"true"`  | **Whole-IP passthrough.** All TCP/UDP traffic to the LoadBalancer IP is forwarded to the backend pod.           |
+| `"false"` | **Per-port filtering.** Only TCP/UDP traffic to ports listed in `Service.spec.ports` is forwarded; rest dropped.|
+| absent    | Service is not managed by cozy-proxy.                                                                           |
+
+In both managed modes, egress traffic from the backend pod is SNATed to the
+LoadBalancer IP for source-IP preservation.
+
+## Datapath
+
+The nftables ruleset placed in table `ip cozy_proxy` consists of:
+
+- Chain `egress_snat` at priority `raw` (-300): rewrites packet source IP via
+  the `pod_svc` map for outbound traffic from managed pods. Runs before
+  conntrack so the recorded tuple has `saddr=LB_IP`.
+- Chain `ingress_dnat` at priority `mangle` (-150): rewrites packet
+  destination IP via the `svc_pod` map for inbound traffic to a LoadBalancer
+  IP. Runs after conntrack so reply packets of egress flows are matched
+  correctly.
+- Chain `port_filter` at priority `filter` (0): for Services in port-filter
+  mode (`wholeIP: "false"`), drops ingress packets whose
+  `(daddr, l4proto, dport)` is not in `allowed_ports`. The chain accepts
+  packets in conntrack states `established` or `related` first, so reply
+  packets of egress flows bypass the filter even when their dport is the VM's
+  ephemeral source port.
 
 ## Installation
 
@@ -35,7 +67,7 @@ helm install cozy-proxy charts/cozy-proxy -n kube-system
 
 ## Usage
 
-Create a LoadBalancer service with `networking.cozystack.io/wholeIP=true` annotation:
+Create a LoadBalancer service with `networking.cozystack.io/wholeIP: "true"` annotation:
 
 ```yaml
 apiVersion: v1
