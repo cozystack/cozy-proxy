@@ -24,6 +24,20 @@ type ProxyProcessor interface {
 	// keepFilters. Any stale entries are removed. The PortFilterEntry struct
 	// carries both the pod IP (used as the actual nft key) and the ports.
 	CleanupPortFilters(keepFilters map[string]PortFilterEntry) error
+
+	// EnsureICMPAllow adds the pod IP to the ICMP allowlist consulted by the
+	// port_filter chain. With this in place, ICMP traffic to a pod that is
+	// otherwise port-filtered is accepted instead of dropped (preserves ping,
+	// PMTU discovery, ICMP unreachable signalling). Idempotent.
+	EnsureICMPAllow(SvcIP, PodIP string) error
+
+	// DeleteICMPAllow removes the pod IP from the ICMP allowlist. No-op if
+	// not present.
+	DeleteICMPAllow(SvcIP, PodIP string) error
+
+	// CleanupICMPAllow keeps only the entries listed in keepICMP (svcIP →
+	// podIP) in the ICMP allowlist; everything else is removed.
+	CleanupICMPAllow(keepICMP map[string]string) error
 }
 
 // PortFilterEntry describes a port-filter desired state in the controller's

@@ -28,9 +28,10 @@ type NFTProxyProcessor struct {
 	svcPodMap *nftables.Set // Map "svc_pod": maps svc IP → pod IP.
 
 	// Port-filtering objects (post-DNAT, key on pod IP).
-	filteredPods *nftables.Set   // set of pod IPs subject to port filtering.
-	allowedPorts *nftables.Set   // concat set: (ipv4_addr . inet_proto . inet_service).
-	portFilterCh *nftables.Chain // chain "port_filter" running post-conntrack and post-ingress_dnat.
+	filteredPods    *nftables.Set   // set of pod IPs subject to port filtering.
+	allowedPorts    *nftables.Set   // concat set: (ipv4_addr . inet_proto . inet_service).
+	icmpAllowedPods *nftables.Set   // set of pod IPs that should accept ICMP in port_filter.
+	portFilterCh    *nftables.Chain // chain "port_filter" running post-conntrack and post-ingress_dnat.
 }
 
 // InitRules initializes the nftables configuration in a single table "cozy_proxy".
@@ -124,6 +125,20 @@ func (p *NFTProxyProcessor) InitRules() error {
 		return fmt.Errorf("could not add allowed_ports set: %v", err)
 	}
 	log.Info("Created allowed_ports concat set", "set", p.allowedPorts.Name)
+
+	// Set "icmp_allowed_pods": pod IPs whose ICMP traffic should bypass the
+	// port_filter drop rule. Opt-in via the allowICMP service annotation,
+	// applies only to pods also present in filtered_pods.
+	p.icmpAllowedPods = &nftables.Set{
+		Table:   p.table,
+		Name:    "icmp_allowed_pods",
+		KeyType: nftables.TypeIPAddr,
+	}
+	if err := p.conn.AddSet(p.icmpAllowedPods, nil); err != nil {
+		log.Error(err, "Could not add icmp_allowed_pods set")
+		return fmt.Errorf("could not add icmp_allowed_pods set: %v", err)
+	}
+	log.Info("Created icmp_allowed_pods set", "set", p.icmpAllowedPods.Name)
 
 	// --- Delete Chains ---
 	chains, _ := p.conn.ListChains()
@@ -264,6 +279,47 @@ func (p *NFTProxyProcessor) InitRules() error {
 		},
 	})
 	log.Info("Added port_filter ct established,related accept rule")
+
+	// --- port_filter rule: ICMP opt-in accept ---
+	// Equivalent to:
+	//   ip daddr @icmp_allowed_pods meta l4proto icmp accept
+	//
+	// Without this, ICMP to a filtered pod IP is dropped by the rule below
+	// because it composes its lookup key from (daddr, l4proto, th_dport) and
+	// the controller only populates allowed_ports with TCP/UDP entries —
+	// breaking ping, PMTU discovery (ICMP Frag Needed), and ICMP unreachable
+	// signalling. Services that opt in via the allowICMP annotation get their
+	// pod IP added to icmp_allowed_pods, which gates this accept.
+	p.conn.AddRule(&nftables.Rule{
+		Table: p.table,
+		Chain: p.portFilterCh,
+		Exprs: []expr.Any{
+			// Gate: ip daddr in icmp_allowed_pods (continue if matched).
+			&expr.Payload{
+				DestRegister: 1,
+				Base:         expr.PayloadBaseNetworkHeader,
+				Offset:       16, // IPv4 daddr (post-ingress_dnat: pod IP)
+				Len:          4,
+			},
+			&expr.Lookup{
+				SourceRegister: 1,
+				SetName:        p.icmpAllowedPods.Name,
+				SetID:          p.icmpAllowedPods.ID,
+			},
+			// meta l4proto == ICMP.
+			&expr.Meta{
+				Key:      expr.MetaKeyL4PROTO,
+				Register: 1,
+			},
+			&expr.Cmp{
+				Op:       expr.CmpOpEq,
+				Register: 1,
+				Data:     []byte{unix.IPPROTO_ICMP},
+			},
+			&expr.Verdict{Kind: expr.VerdictAccept},
+		},
+	})
+	log.Info("Added port_filter ICMP accept rule")
 
 	// --- port_filter rule ---
 	// Equivalent to:
@@ -802,6 +858,108 @@ func (p *NFTProxyProcessor) removeAllowedPortsForPod(parsedPodIP net.IP) error {
 			return fmt.Errorf("failed to delete stale allowed_ports for pod: %v", err)
 		}
 	}
+	return nil
+}
+
+// EnsureICMPAllow adds podIP to the icmp_allowed_pods set so that ICMP
+// traffic to that pod IP bypasses the port_filter drop rule. svcIP is used
+// only for logging context. Idempotent.
+func (p *NFTProxyProcessor) EnsureICMPAllow(svcIP, podIP string) error {
+	log.Info("Ensuring ICMP allow", "svcIP", svcIP, "podIP", podIP)
+	parsedPodIP := net.ParseIP(podIP).To4()
+	if parsedPodIP == nil {
+		return fmt.Errorf("invalid podIP: %s", podIP)
+	}
+	if err := p.conn.SetAddElements(p.icmpAllowedPods, []nftables.SetElement{{Key: parsedPodIP}}); err != nil {
+		return fmt.Errorf("failed to add %s to icmp_allowed_pods: %v", podIP, err)
+	}
+	if err := p.conn.Flush(); err != nil {
+		return fmt.Errorf("failed to flush EnsureICMPAllow: %v", err)
+	}
+	log.Info("ICMP allow ensured", "svcIP", svcIP, "podIP", podIP)
+	return nil
+}
+
+// DeleteICMPAllow removes podIP from icmp_allowed_pods. Tolerates ENOENT for
+// clean idempotency. svcIP is used only for logging context.
+func (p *NFTProxyProcessor) DeleteICMPAllow(svcIP, podIP string) error {
+	log.Info("Deleting ICMP allow", "svcIP", svcIP, "podIP", podIP)
+	parsedPodIP := net.ParseIP(podIP).To4()
+	if parsedPodIP == nil {
+		return fmt.Errorf("invalid podIP: %s", podIP)
+	}
+	if err := p.conn.SetDeleteElements(p.icmpAllowedPods, []nftables.SetElement{{Key: parsedPodIP}}); err != nil {
+		if !errors.Is(err, unix.ENOENT) {
+			return fmt.Errorf("failed to delete %s from icmp_allowed_pods: %v", podIP, err)
+		}
+	}
+	if err := p.conn.Flush(); err != nil {
+		if errors.Is(err, unix.ENOENT) {
+			log.Info("DeleteICMPAllow ENOENT on flush — already gone", "podIP", podIP)
+			return nil
+		}
+		return fmt.Errorf("failed to flush DeleteICMPAllow: %v", err)
+	}
+	log.Info("ICMP allow deleted", "svcIP", svcIP, "podIP", podIP)
+	return nil
+}
+
+// CleanupICMPAllow reconciles icmp_allowed_pods with the desired snapshot.
+// keep is keyed by svcIP (caller convenience); the value is the podIP that
+// must remain in the set. Single-pass diff with one Flush, mirroring
+// CleanupPortFilters.
+func (p *NFTProxyProcessor) CleanupICMPAllow(keep map[string]string) error {
+	log.Info("Starting CleanupICMPAllow", "keepCount", len(keep))
+
+	desired := make(map[string]bool, len(keep))
+	for _, podIP := range keep {
+		if net.ParseIP(podIP).To4() == nil {
+			log.Info("Skipping invalid podIP in ICMP cleanup keep map", "podIP", podIP)
+			continue
+		}
+		desired[podIP] = true
+	}
+
+	current, err := p.conn.GetSetElements(p.icmpAllowedPods)
+	if err != nil {
+		return fmt.Errorf("failed to list icmp_allowed_pods: %v", err)
+	}
+
+	var addPods, delPods []nftables.SetElement
+	seen := make(map[string]bool, len(current))
+	for _, el := range current {
+		ipStr := net.IP(el.Key).String()
+		seen[ipStr] = true
+		if !desired[ipStr] {
+			delPods = append(delPods, nftables.SetElement{Key: el.Key})
+		}
+	}
+	for podIPStr := range desired {
+		if !seen[podIPStr] {
+			parsed := net.ParseIP(podIPStr).To4()
+			if parsed == nil {
+				continue
+			}
+			addPods = append(addPods, nftables.SetElement{Key: parsed})
+		}
+	}
+
+	if len(delPods) > 0 {
+		if err := p.conn.SetDeleteElements(p.icmpAllowedPods, delPods); err != nil {
+			return fmt.Errorf("failed to delete stale icmp_allowed_pods: %v", err)
+		}
+	}
+	if len(addPods) > 0 {
+		if err := p.conn.SetAddElements(p.icmpAllowedPods, addPods); err != nil {
+			return fmt.Errorf("failed to add icmp_allowed_pods: %v", err)
+		}
+	}
+
+	if err := p.conn.Flush(); err != nil {
+		return fmt.Errorf("failed to flush CleanupICMPAllow: %v", err)
+	}
+	log.Info("CleanupICMPAllow completed",
+		"addedPods", len(addPods), "removedPods", len(delPods))
 	return nil
 }
 
