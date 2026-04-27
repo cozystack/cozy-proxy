@@ -148,20 +148,20 @@ func (p *NFTProxyProcessor) InitRules() error {
 	})
 	log.Info("Created port_filter chain", "priority", "filter (0)")
 
-	earlySNAT := p.conn.AddChain(&nftables.Chain{
-		Name:     "early_snat",
+	egressSNAT := p.conn.AddChain(&nftables.Chain{
+		Name:     "egress_snat",
 		Table:    p.table,
 		Type:     nftables.ChainTypeFilter,
 		Hooknum:  nftables.ChainHookPrerouting,
 		Priority: nftables.ChainPriorityRaw,
 	})
-	log.Info("Created early_snat chain")
+	log.Info("Created egress_snat chain", "priority", "raw (-300)")
 
-	// --- Add Rules ---
-	// Add SNAT rule: ip saddr @pod ip saddr set ip saddr map @pod_svc
+	// SNAT rule: rewrite saddr from pod IP to svc IP (egress IP preservation).
+	// Runs BEFORE conntrack so the tracked tuple has saddr=LB_IP.
 	p.conn.AddRule(&nftables.Rule{
 		Table: p.table,
-		Chain: earlySNAT,
+		Chain: egressSNAT,
 		Exprs: []expr.Any{
 			&expr.Payload{
 				DestRegister: 1,
@@ -188,11 +188,23 @@ func (p *NFTProxyProcessor) InitRules() error {
 			},
 		},
 	})
+	log.Info("Added egress_snat saddr rewrite rule")
 
-	// Add DNAT rule: ip daddr @svc ip daddr set ip daddr map @svc_pod
+	ingressDNAT := p.conn.AddChain(&nftables.Chain{
+		Name:     "ingress_dnat",
+		Table:    p.table,
+		Type:     nftables.ChainTypeFilter,
+		Hooknum:  nftables.ChainHookPrerouting,
+		Priority: nftables.ChainPriorityMangle,
+	})
+	log.Info("Created ingress_dnat chain", "priority", "mangle (-150)")
+
+	// DNAT rule: rewrite daddr from svc IP to pod IP. Runs AFTER conntrack
+	// so conntrack records the original daddr=LB_IP and can correctly match
+	// reply packets of egress flows.
 	p.conn.AddRule(&nftables.Rule{
 		Table: p.table,
-		Chain: earlySNAT,
+		Chain: ingressDNAT,
 		Exprs: []expr.Any{
 			&expr.Payload{
 				DestRegister: 1,
@@ -219,7 +231,7 @@ func (p *NFTProxyProcessor) InitRules() error {
 			},
 		},
 	})
-	log.Info("Added early_snat rules (SNAT and DNAT)")
+	log.Info("Added ingress_dnat daddr rewrite rule")
 
 	// --- port_filter rule: bypass for established/related ---
 	// Idiomatic stateful firewall: any packet that belongs to an existing
