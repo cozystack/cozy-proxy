@@ -576,6 +576,14 @@ func (p *NFTProxyProcessor) CleanupRules(keepMap map[string]string) error {
 // permitted on the post-DNAT pod IP; all other traffic destined to that
 // pod IP is dropped. Idempotent.
 func (p *NFTProxyProcessor) EnsurePortFilter(svcIP, podIP string, ports []corev1.ServicePort) error {
+	// Empty ports list is documented as equivalent to DeletePortFilter:
+	// the caller wants to disable filtering for this pod entirely. Without
+	// this short-circuit we would add the pod to filtered_pods with no
+	// matching allowed_ports entries, which would drop every ingress packet
+	// to the pod IP — the opposite of "no filter".
+	if len(ports) == 0 {
+		return p.DeletePortFilter(svcIP, podIP)
+	}
 	log.Info("Ensuring port filter", "svcIP", svcIP, "podIP", podIP, "portCount", len(ports))
 
 	parsedPodIP := net.ParseIP(podIP).To4()
