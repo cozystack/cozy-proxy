@@ -9,6 +9,7 @@ import (
 	"github.com/google/nftables"
 	"github.com/google/nftables/expr"
 	"golang.org/x/sys/unix"
+	corev1 "k8s.io/api/core/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
 )
 
@@ -21,9 +22,14 @@ type NFTProxyProcessor struct {
 	// Table "cozy_proxy" will contain all objects.
 	table *nftables.Table
 
-	// Sets and maps.
+	// IP-only NAT objects.
 	podSvcMap *nftables.Set // Map "pod_svc": maps pod IP → svc IP.
 	svcPodMap *nftables.Set // Map "svc_pod": maps svc IP → pod IP.
+
+	// Port-filtering objects.
+	filteredSvcs *nftables.Set   // set of svc IPs subject to port filtering.
+	allowedPorts *nftables.Set   // concat set: (ipv4_addr . inet_proto . inet_service).
+	portFilterCh *nftables.Chain // chain "port_filter" running before early_snat.
 }
 
 // InitRules initializes the nftables configuration in a single table "cozy_proxy".
@@ -80,6 +86,42 @@ func (p *NFTProxyProcessor) InitRules() error {
 	}
 	log.Info("Created svc_pod map", "map", p.svcPodMap.Name)
 
+	// --- Port filter sets ---
+	// Set "filtered_svcs": svc IPs subject to ingress port filtering.
+	p.filteredSvcs = &nftables.Set{
+		Table:   p.table,
+		Name:    "filtered_svcs",
+		KeyType: nftables.TypeIPAddr,
+	}
+	if err := p.conn.AddSet(p.filteredSvcs, nil); err != nil {
+		log.Error(err, "Could not add filtered_svcs set")
+		return fmt.Errorf("could not add filtered_svcs set: %v", err)
+	}
+	log.Info("Created filtered_svcs set", "set", p.filteredSvcs.Name)
+
+	// Set "allowed_ports": concat key (ipv4_addr . inet_proto . inet_service).
+	// Each component is padded to a 4-byte slot, total 12 bytes.
+	allowedKeyType, err := nftables.ConcatSetType(
+		nftables.TypeIPAddr,
+		nftables.TypeInetProto,
+		nftables.TypeInetService,
+	)
+	if err != nil {
+		log.Error(err, "Could not build allowed_ports key type")
+		return fmt.Errorf("could not build allowed_ports key type: %v", err)
+	}
+	p.allowedPorts = &nftables.Set{
+		Table:         p.table,
+		Name:          "allowed_ports",
+		KeyType:       allowedKeyType,
+		Concatenation: true,
+	}
+	if err := p.conn.AddSet(p.allowedPorts, nil); err != nil {
+		log.Error(err, "Could not add allowed_ports set")
+		return fmt.Errorf("could not add allowed_ports set: %v", err)
+	}
+	log.Info("Created allowed_ports concat set", "set", p.allowedPorts.Name)
+
 	// --- Delete Chains ---
 	chains, _ := p.conn.ListChains()
 	for _, chain := range chains {
@@ -89,6 +131,18 @@ func (p *NFTProxyProcessor) InitRules() error {
 	}
 
 	// --- Create Chains ---
+	// port_filter runs at priority -350, BEFORE early_snat (-300), so any
+	// drop verdict short-circuits before SNAT/DNAT rewrites.
+	portFilterPriority := nftables.ChainPriorityRef(-350)
+	p.portFilterCh = p.conn.AddChain(&nftables.Chain{
+		Name:     "port_filter",
+		Table:    p.table,
+		Type:     nftables.ChainTypeFilter,
+		Hooknum:  nftables.ChainHookPrerouting,
+		Priority: portFilterPriority,
+	})
+	log.Info("Created port_filter chain", "priority", -350)
+
 	earlySNAT := p.conn.AddChain(&nftables.Chain{
 		Name:     "early_snat",
 		Table:    p.table,
@@ -161,6 +215,59 @@ func (p *NFTProxyProcessor) InitRules() error {
 		},
 	})
 	log.Info("Added early_snat rules (SNAT and DNAT)")
+
+	// --- port_filter rule ---
+	// Equivalent to:
+	//   ip daddr @filtered_svcs ip daddr . meta l4proto . th dport != @allowed_ports drop
+	//
+	// Implementation: lay out the 12-byte concat key across NFT_REG32_00..02
+	// (register IDs 8, 9, 10), then a single inverted lookup against
+	// allowed_ports. Lookup reads s.KeyType.Bytes (12) bytes starting at the
+	// source register, so the three 4-byte slots must be contiguous.
+	p.conn.AddRule(&nftables.Rule{
+		Table: p.table,
+		Chain: p.portFilterCh,
+		Exprs: []expr.Any{
+			// 1. Gate: ip daddr in filtered_svcs (continue if matched).
+			&expr.Payload{
+				DestRegister: 1,
+				Base:         expr.PayloadBaseNetworkHeader,
+				Offset:       16, // IPv4 daddr
+				Len:          4,
+			},
+			&expr.Lookup{
+				SourceRegister: 1,
+				SetName:        p.filteredSvcs.Name,
+				SetID:          p.filteredSvcs.ID,
+			},
+			// 2. Build composite key (daddr . l4proto . dport) into reg32_00..02.
+			&expr.Payload{
+				DestRegister: unix.NFT_REG32_00,
+				Base:         expr.PayloadBaseNetworkHeader,
+				Offset:       16,
+				Len:          4,
+			},
+			&expr.Meta{
+				Key:      expr.MetaKeyL4PROTO,
+				Register: unix.NFT_REG32_01,
+			},
+			&expr.Payload{
+				DestRegister: unix.NFT_REG32_02,
+				Base:         expr.PayloadBaseTransportHeader,
+				Offset:       2, // dport (TCP and UDP both at byte 2)
+				Len:          2,
+			},
+			// 3. If (daddr, proto, dport) NOT in allowed_ports → drop.
+			&expr.Lookup{
+				SourceRegister: unix.NFT_REG32_00,
+				SetName:        p.allowedPorts.Name,
+				SetID:          p.allowedPorts.ID,
+				Invert:         true,
+			},
+			&expr.Verdict{Kind: expr.VerdictDrop},
+		},
+	})
+	log.Info("Added port_filter drop rule")
 
 	// Commit all changes.
 	if err := p.conn.Flush(); err != nil {
@@ -408,3 +515,149 @@ func (p *NFTProxyProcessor) CleanupRules(keepMap map[string]string) error {
 	log.Info("CleanupRules completed successfully")
 	return nil
 }
+
+// EnsurePortFilter installs ingress port filtering rules for svcIP. The given
+// ports are the only ones permitted; all other ingress traffic to svcIP is
+// dropped before the SNAT/DNAT chain runs. Idempotent.
+func (p *NFTProxyProcessor) EnsurePortFilter(svcIP string, ports []corev1.ServicePort) error {
+	log.Info("Ensuring port filter", "svcIP", svcIP, "portCount", len(ports))
+
+	parsedSvcIP := net.ParseIP(svcIP).To4()
+	if parsedSvcIP == nil {
+		return fmt.Errorf("invalid svcIP: %s", svcIP)
+	}
+
+	// 1. Remove any pre-existing entries in allowed_ports for svcIP so we can
+	// rebuild the tuple set cleanly (idempotent).
+	if err := p.removeAllowedPortsForSvc(parsedSvcIP); err != nil {
+		return err
+	}
+
+	// 2. Add svcIP to filtered_svcs (idempotent — Add ignores duplicates).
+	if err := p.conn.SetAddElements(p.filteredSvcs, []nftables.SetElement{{Key: parsedSvcIP}}); err != nil {
+		return fmt.Errorf("failed to add %s to filtered_svcs: %v", svcIP, err)
+	}
+
+	// 3. Add allowed (svcIP, proto, port) tuples.
+	for _, sp := range ports {
+		var protoByte byte
+		switch sp.Protocol {
+		case corev1.ProtocolTCP, "":
+			protoByte = unix.IPPROTO_TCP
+		case corev1.ProtocolUDP:
+			protoByte = unix.IPPROTO_UDP
+		default:
+			log.Info("Skipping unsupported protocol for port filter",
+				"svcIP", svcIP, "protocol", sp.Protocol)
+			continue
+		}
+		key := concatPortKey(parsedSvcIP, protoByte, uint16(sp.Port))
+		if err := p.conn.SetAddElements(p.allowedPorts, []nftables.SetElement{{Key: key}}); err != nil {
+			return fmt.Errorf("failed to add port tuple to allowed_ports (svc=%s proto=%v port=%d): %v",
+				svcIP, sp.Protocol, sp.Port, err)
+		}
+	}
+
+	if err := p.conn.Flush(); err != nil {
+		return fmt.Errorf("failed to flush EnsurePortFilter: %v", err)
+	}
+	log.Info("Port filter ensured", "svcIP", svcIP, "ports", ports)
+	return nil
+}
+
+// DeletePortFilter removes svcIP from filtered_svcs and clears any allowed
+// port entries for it. Tolerates ENOENT for clean idempotency.
+func (p *NFTProxyProcessor) DeletePortFilter(svcIP string) error {
+	log.Info("Deleting port filter", "svcIP", svcIP)
+	parsedSvcIP := net.ParseIP(svcIP).To4()
+	if parsedSvcIP == nil {
+		return fmt.Errorf("invalid svcIP: %s", svcIP)
+	}
+	if err := p.removeAllowedPortsForSvc(parsedSvcIP); err != nil {
+		return err
+	}
+	if err := p.conn.SetDeleteElements(p.filteredSvcs, []nftables.SetElement{{Key: parsedSvcIP}}); err != nil {
+		if !errors.Is(err, unix.ENOENT) {
+			return fmt.Errorf("failed to delete %s from filtered_svcs: %v", svcIP, err)
+		}
+	}
+	if err := p.conn.Flush(); err != nil {
+		if errors.Is(err, unix.ENOENT) {
+			log.Info("DeletePortFilter ENOENT on flush — already gone", "svcIP", svcIP)
+			return nil
+		}
+		return fmt.Errorf("failed to flush DeletePortFilter: %v", err)
+	}
+	log.Info("Port filter deleted", "svcIP", svcIP)
+	return nil
+}
+
+// CleanupPortFilters reconciles port_filter state with the desired snapshot.
+// It removes any svcIP not in keep, and ensures filters for those that are.
+func (p *NFTProxyProcessor) CleanupPortFilters(keep map[string][]corev1.ServicePort) error {
+	log.Info("Starting CleanupPortFilters", "keepCount", len(keep))
+
+	desired := make(map[string]bool, len(keep))
+	for svcIP := range keep {
+		desired[svcIP] = true
+	}
+
+	current, err := p.conn.GetSetElements(p.filteredSvcs)
+	if err != nil {
+		return fmt.Errorf("failed to list filtered_svcs: %v", err)
+	}
+	for _, el := range current {
+		ipStr := net.IP(el.Key).String()
+		if !desired[ipStr] {
+			log.Info("Removing stale filtered_svc", "svcIP", ipStr)
+			if err := p.DeletePortFilter(ipStr); err != nil {
+				return fmt.Errorf("cleanup delete %s: %v", ipStr, err)
+			}
+		}
+	}
+	for svcIP, ports := range keep {
+		if err := p.EnsurePortFilter(svcIP, ports); err != nil {
+			return fmt.Errorf("cleanup ensure %s: %v", svcIP, err)
+		}
+	}
+	return nil
+}
+
+// concatPortKey returns the bytes for a (ipv4 . proto . port) concat set key.
+// nftables packs each component to 4-byte-aligned slots: 4 + 4 + 4 = 12 bytes.
+// proto goes in the low byte of slot 1, port goes in the first 2 bytes
+// (big-endian) of slot 2.
+func concatPortKey(ipv4 net.IP, proto byte, port uint16) []byte {
+	key := make([]byte, 12)
+	copy(key[0:4], ipv4.To4())
+	key[4] = proto
+	// bytes 5,6,7 stay zero (padding)
+	key[8] = byte(port >> 8)
+	key[9] = byte(port & 0xff)
+	// bytes 10,11 stay zero (padding)
+	return key
+}
+
+// removeAllowedPortsForSvc deletes all allowed_ports entries whose key prefix
+// matches parsedSvcIP. Used to make EnsurePortFilter idempotent.
+func (p *NFTProxyProcessor) removeAllowedPortsForSvc(parsedSvcIP net.IP) error {
+	elems, err := p.conn.GetSetElements(p.allowedPorts)
+	if err != nil {
+		return fmt.Errorf("failed to list allowed_ports: %v", err)
+	}
+	var toDel []nftables.SetElement
+	for _, el := range elems {
+		if len(el.Key) >= 4 && bytes.Equal(el.Key[:4], parsedSvcIP.To4()) {
+			toDel = append(toDel, nftables.SetElement{Key: el.Key})
+		}
+	}
+	if len(toDel) > 0 {
+		if err := p.conn.SetDeleteElements(p.allowedPorts, toDel); err != nil {
+			return fmt.Errorf("failed to delete stale allowed_ports for svc: %v", err)
+		}
+	}
+	return nil
+}
+
+// Compile-time assertion that NFTProxyProcessor satisfies ProxyProcessor.
+var _ ProxyProcessor = (*NFTProxyProcessor)(nil)
