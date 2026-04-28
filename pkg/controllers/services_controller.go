@@ -475,42 +475,27 @@ const (
 	serviceProxyName = "cozy-proxy"
 )
 
-// isCozyProxyService reports whether the service should be managed by cozy-proxy.
-// A service is selected if it carries the
-// service.kubernetes.io/service-proxy-name=cozy-proxy label (standard
-// Kubernetes mechanism, also tells kube-proxy to ignore the service) or the
-// networking.cozystack.io/wholeIP annotation (any value — the value drives
-// passthrough vs port-filter mode, see wholeIPPassthrough).
+// isCozyProxyService reports whether the service should be managed by
+// cozy-proxy. The sole selector is the standard Kubernetes
+// service.kubernetes.io/service-proxy-name=cozy-proxy label, which also
+// tells kube-proxy to ignore the service. Services without the label are
+// not managed regardless of any cozy-proxy annotations they may carry.
 func isCozyProxyService(svc *v1.Service) bool {
 	if svc == nil {
 		return false
 	}
-	if svc.Labels[serviceProxyNameLabel] == serviceProxyName {
-		return true
-	}
-	return hasWholeIPAnnotation(svc)
-}
-
-// hasWholeIPAnnotation reports whether the service carries the wholeIP
-// annotation. Any value is accepted; the value's meaning (passthrough vs
-// port-filter) is determined by wholeIPPassthrough.
-func hasWholeIPAnnotation(svc *v1.Service) bool {
-	if svc == nil {
-		return false
-	}
-	_, ok := svc.Annotations[wholeIPAnnotation]
-	return ok
+	return svc.Labels[serviceProxyNameLabel] == serviceProxyName
 }
 
 // wholeIPPassthrough reports whether ingress traffic should bypass port
-// filtering. Defaults to true for any value other than the explicit string
-// "false", so services selected by label alone (no annotation) and services
-// with annotation: "true" both behave as passthrough.
+// filtering. Opt-in: requires an explicit networking.cozystack.io/wholeIP=true
+// annotation. Any other value, or no annotation at all, keeps the service in
+// the default port-filter mode.
 func wholeIPPassthrough(svc *v1.Service) bool {
 	if svc == nil || svc.Annotations == nil {
-		return true
+		return false
 	}
-	return svc.Annotations[wholeIPAnnotation] != "false"
+	return svc.Annotations[wholeIPAnnotation] == "true"
 }
 
 // allowICMP reports whether ICMP traffic should bypass the port_filter drop

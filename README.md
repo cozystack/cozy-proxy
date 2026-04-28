@@ -17,37 +17,29 @@ The last option is the simplest and most flexible, but it has a limitation: Kube
 but only traffic on specific ports (see: [Kubernetes Issue #23864](https://github.com/kubernetes/kubernetes/issues/23864)).
 Additionally, kube-proxy does not perform SNAT, which causes outgoing traffic from the pod to use the default gateway of the host where it is running.
 
-To address these issues, we have added an additional controller that performs 1:1 NAT for services selected by either the `service.kubernetes.io/service-proxy-name: cozy-proxy` label or the `networking.cozystack.io/wholeIP` annotation.
+To address these issues, we have added an additional controller that performs NAT for services carrying the `service.kubernetes.io/service-proxy-name: cozy-proxy` label.
 
 ## How It Works
 
-cozy-proxy is a simple Kubernetes controller that watches for services selected by either of the following:
-
-- **`service.kubernetes.io/service-proxy-name: cozy-proxy`** label (recommended) — the standard Kubernetes mechanism for delegating a service to a non-default proxy. kube-proxy skips services carrying this label, so cozy-proxy becomes the sole handler and no rules collide.
-- **`networking.cozystack.io/wholeIP`** annotation — also selects the service for management. The annotation value additionally drives the ingress mode (see below).
+cozy-proxy is a simple Kubernetes controller that watches for services labeled with `service.kubernetes.io/service-proxy-name: cozy-proxy` — the standard Kubernetes mechanism for delegating a service to a non-default proxy. kube-proxy skips services carrying this label, so cozy-proxy becomes the sole handler and no rules collide.
 
 When it finds such a service, it creates NFT rules that forward traffic from the service's external IP to the pod's IP and vice versa, performing source-IP preservation for egress traffic.
 
 This controller can be used together with kube-proxy and Cilium in kube-proxy replacement mode.
 
-### Which selector should I use?
-
-- If your cluster runs **plain kube-proxy** (iptables or IPVS mode) — for example, a default RKE2/kubeadm install with Calico or Flannel — use the `service.kubernetes.io/service-proxy-name: cozy-proxy` label. Without it, kube-proxy installs its own LoadBalancer rules that conflict with cozy-proxy's NAT and break outbound SNAT.
-- If your cluster runs **Cilium in kube-proxy replacement mode** (as in the reference Cozystack environment), either selector works.
-
-You can safely set both on the same service.
+> The label is the **only** selector. Services that do not carry it are not managed by cozy-proxy, regardless of any annotations they may have.
 
 ## Ingress mode
 
-The `networking.cozystack.io/wholeIP` annotation value selects the ingress mode:
+The optional `networking.cozystack.io/wholeIP` annotation selects the ingress mode for a managed service:
 
-| Value     | Behavior                                                                                                        |
-|-----------|-----------------------------------------------------------------------------------------------------------------|
-| `"true"`  | **Whole-IP passthrough.** All TCP/UDP traffic to the LoadBalancer IP is forwarded to the backend pod.           |
-| `"false"` | **Per-port filtering.** Only TCP/UDP traffic to ports listed in `Service.spec.ports` is forwarded; rest dropped.|
-| absent    | Defaults to **passthrough** (services selected by label only behave the same as `wholeIP: "true"`).             |
+| Value     | Behavior                                                                                                              |
+|-----------|-----------------------------------------------------------------------------------------------------------------------|
+| `"true"`  | **Whole-IP passthrough.** All TCP/UDP traffic to the LoadBalancer IP is forwarded to the backend pod.                 |
+| `"false"` | **Per-port filtering** (default). Only TCP/UDP traffic to ports listed in `Service.spec.ports` is forwarded; rest dropped. |
+| absent    | Same as `"false"` — per-port filtering.                                                                               |
 
-In both managed modes, egress traffic from the backend pod is SNATed to the
+In both modes, egress traffic from the backend pod is SNATed to the
 LoadBalancer IP for source-IP preservation.
 
 The optional `networking.cozystack.io/allowICMP: "true"` annotation, only
@@ -88,7 +80,7 @@ helm install cozy-proxy charts/cozy-proxy -n kube-system
 
 ## Usage
 
-Create a LoadBalancer service with the `service.kubernetes.io/service-proxy-name: cozy-proxy` label. This also tells kube-proxy to stay away from the service:
+Create a LoadBalancer service with the `service.kubernetes.io/service-proxy-name: cozy-proxy` label. The default mode is per-port filtering, so to forward every port to the backend pod (whole-IP passthrough) add the `networking.cozystack.io/wholeIP: "true"` annotation:
 
 ```yaml
 apiVersion: v1
@@ -97,6 +89,8 @@ metadata:
   name: example-service
   labels:
     service.kubernetes.io/service-proxy-name: cozy-proxy
+  annotations:
+    networking.cozystack.io/wholeIP: "true"
 spec:
   allocateLoadBalancerNodePorts: false
   externalTrafficPolicy: Local
