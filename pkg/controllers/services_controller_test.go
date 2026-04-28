@@ -11,22 +11,26 @@ func svcWith(annot map[string]string) *v1.Service {
 	return &v1.Service{ObjectMeta: metav1.ObjectMeta{Annotations: annot}}
 }
 
-func TestHasWholeIPAnnotation(t *testing.T) {
+func svcWithLabels(labels map[string]string) *v1.Service {
+	return &v1.Service{ObjectMeta: metav1.ObjectMeta{Labels: labels}}
+}
+
+func TestIsCozyProxyService(t *testing.T) {
 	cases := []struct {
 		name   string
 		svc    *v1.Service
 		expect bool
 	}{
-		{"true value", svcWith(map[string]string{"networking.cozystack.io/wholeIP": "true"}), true},
-		{"false value", svcWith(map[string]string{"networking.cozystack.io/wholeIP": "false"}), true},
-		{"absent annotation", svcWith(map[string]string{}), false},
-		{"nil annotations", &v1.Service{}, false},
-		{"unrelated annotation", svcWith(map[string]string{"foo": "bar"}), false},
+		{"label with correct value", svcWithLabels(map[string]string{"service.kubernetes.io/service-proxy-name": "cozy-proxy"}), true},
+		{"label with other value", svcWithLabels(map[string]string{"service.kubernetes.io/service-proxy-name": "kube-router"}), false},
+		{"label absent", svcWithLabels(map[string]string{}), false},
+		{"nil service", nil, false},
+		{"only wholeIP annotation no label", svcWith(map[string]string{"networking.cozystack.io/wholeIP": "true"}), false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			if got := hasWholeIPAnnotation(c.svc); got != c.expect {
-				t.Errorf("hasWholeIPAnnotation = %v, want %v", got, c.expect)
+			if got := isCozyProxyService(c.svc); got != c.expect {
+				t.Errorf("isCozyProxyService = %v, want %v", got, c.expect)
 			}
 		})
 	}
@@ -38,10 +42,11 @@ func TestWholeIPPassthrough(t *testing.T) {
 		svc    *v1.Service
 		expect bool
 	}{
-		{"true value", svcWith(map[string]string{"networking.cozystack.io/wholeIP": "true"}), true},
-		{"false value", svcWith(map[string]string{"networking.cozystack.io/wholeIP": "false"}), false},
-		{"absent annotation defaults to passthrough", svcWith(map[string]string{}), true},
-		{"nil annotations defaults to passthrough", &v1.Service{}, true},
+		{"explicit true", svcWith(map[string]string{"networking.cozystack.io/wholeIP": "true"}), true},
+		{"explicit false", svcWith(map[string]string{"networking.cozystack.io/wholeIP": "false"}), false},
+		{"empty value", svcWith(map[string]string{"networking.cozystack.io/wholeIP": ""}), false},
+		{"absent annotation defaults to port-filter", svcWith(map[string]string{}), false},
+		{"nil annotations defaults to port-filter", &v1.Service{}, false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
