@@ -78,6 +78,8 @@ Install controller using Helm-chart:
 helm install cozy-proxy charts/cozy-proxy -n kube-system
 ```
 
+`make image` builds a linux/amd64 and linux/arm64 image index, which needs a buildx builder that can produce multi-platform output (the docker-container driver, or a Docker daemon with the containerd image store). Pass a single platform such as `PLATFORMS=linux/amd64` to build only that one, for example for a local `LOAD=true`.
+
 ## Usage
 
 Create a LoadBalancer service with the `service.kubernetes.io/service-proxy-name: cozy-proxy` label. The default mode is per-port filtering, so to forward every port to the backend pod (whole-IP passthrough) add the `networking.cozystack.io/wholeIP: "true"` annotation:

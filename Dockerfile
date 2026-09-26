@@ -1,4 +1,7 @@
-FROM golang:1.26-alpine AS builder
+FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS builder
+
+ARG TARGETOS
+ARG TARGETARCH
 
 WORKDIR /workspace
 
@@ -6,7 +9,7 @@ COPY go.mod go.sum main.go ./
 COPY pkg pkg/
 RUN go mod download
 
-RUN CGO_ENABLED=0 go build -ldflags="-extldflags=-static" -o /cozy-proxy main.go
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -ldflags="-extldflags=-static" -o /cozy-proxy main.go
 
 FROM scratch
 
