@@ -70,6 +70,21 @@ The nftables ruleset placed in table `ip cozy_proxy` consists of:
   `allowICMP: "true"` annotation is set, the pod IP is added to
   `icmp_allowed_pods` and ICMP toward it is accepted before the drop rule.
 
+### Rule scoping
+
+The two rewrites are deliberately not scoped alike. Every controller instance
+watches every Service, but programs:
+
+| Object | Scope | Why |
+|---|---|---|
+| `svc_pod` (`ingress_dnat`), `allowed_ports`, `icmp_allowed_pods` | the node hosting the backend pod | A non-hosting node would rewrite the destination before the packet has even left it. The hosting node then records a conntrack tuple of `(client -> podIP)`, while the reply leaves the pod and gets `saddr` rewritten to the service IP by `egress_snat` at priority `raw`, before conntrack. `(svcIP -> client)` matches nothing, so the reply is not `established` and `port_filter` drops it. |
+| `pod_svc` (`egress_snat`) | every node | An intra-cluster client is source-NATed by the CNI to its own node address, which the overlay knows how to reach directly. The backend's reply is then tunnelled straight to that node and never traverses the hosting node's netfilter hooks, so the client's node is the only place left where the pod IP can still be turned back into the service IP. Without the entry there, the reply arrives with the wrong source and the client answers with a RST — a cross-node connection that hangs while the same-node one works. |
+
+`NODE_NAME` carries the node identity; the chart injects it from
+`spec.nodeName`. When it is unset the ingress scope check is disabled and
+everything is programmed everywhere, so the binary still runs under a
+deployment that does not inject it.
+
 ## Installation
 
 Install controller using Helm-chart:

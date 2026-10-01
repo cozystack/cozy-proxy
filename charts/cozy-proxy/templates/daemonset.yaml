@@ -21,6 +21,14 @@ spec:
         - name: cozy-proxy
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          env:
+            # Scopes the ingress rules to the backends hosted on this node; see
+            # "Rule scoping" in the README for why a non-hosting node must not
+            # program them.
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
           securityContext:
             privileged: true
             capabilities:

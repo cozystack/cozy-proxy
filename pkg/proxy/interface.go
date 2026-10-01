@@ -4,9 +4,39 @@ import corev1 "k8s.io/api/core/v1"
 
 type ProxyProcessor interface {
 	InitRules() error
-	EnsureRules(SvcIP, PodIP string) error
-	DeleteRules(SvcIP, PodIP string) error
-	CleanupRules(KeepMap map[string]string) error
+
+	// EnsureEgressSNAT programs the pod_svc entry (pod IP → service IP) read
+	// by the egress_snat chain, so traffic leaving the backend is seen with
+	// the service IP as its source.
+	//
+	// Every node programs it, for every managed service, whether or not it
+	// hosts the backend. A reply from the backend to an intra-cluster client
+	// is handed straight to the client's node over the overlay: it never
+	// traverses the backend node's netfilter hooks, and the client's node is
+	// then the only place left where the source can still be rewritten.
+	EnsureEgressSNAT(SvcIP, PodIP string) error
+
+	// DeleteEgressSNAT removes the pod_svc entry for the pair. No-op if absent.
+	DeleteEgressSNAT(SvcIP, PodIP string) error
+
+	// EnsureIngressDNAT programs the svc_pod entry (service IP → pod IP) read
+	// by the ingress_dnat chain, so traffic addressed to the service IP is
+	// delivered to the backend.
+	//
+	// Only the node hosting the backend may program it. On any other node the
+	// rewrite would happen before the packet even leaves, and the hosting node
+	// would then record a conntrack tuple the reply can no longer match.
+	EnsureIngressDNAT(SvcIP, PodIP string) error
+
+	// DeleteIngressDNAT removes the svc_pod entry for the pair. No-op if absent.
+	DeleteIngressDNAT(SvcIP, PodIP string) error
+
+	// CleanupRules reconciles both maps against the desired state. Both
+	// arguments map service IP → pod IP: keepEgress covers every managed
+	// service, keepIngress only the backends hosted on this node. Anything
+	// else is removed, so state inherited from a build with different scoping
+	// is purged at startup.
+	CleanupRules(keepEgress, keepIngress map[string]string) error
 
 	// EnsurePortFilter installs (or replaces) ingress port-filtering rules
 	// for the given pod IP. Only TCP/UDP traffic destined to one of the
