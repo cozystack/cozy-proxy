@@ -43,7 +43,7 @@ func scratchNetns(t *testing.T) netns.NsHandle {
 	if err != nil {
 		t.Fatalf("netns.Get: %v", err)
 	}
-	defer orig.Close()
+	defer func() { _ = orig.Close() }()
 	ns, err := netns.New() // also switches this thread into it
 	if err != nil {
 		t.Skipf("cannot create a network namespace: %v", err)
@@ -69,7 +69,7 @@ func inNetns(t *testing.T, ns netns.NsHandle, name string, args ...string) (stri
 	if err != nil {
 		t.Fatalf("netns.Get: %v", err)
 	}
-	defer orig.Close()
+	defer func() { _ = orig.Close() }()
 	if err := netns.Set(ns); err != nil {
 		t.Fatalf("netns.Set: %v", err)
 	}

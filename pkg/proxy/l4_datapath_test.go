@@ -54,7 +54,7 @@ func doIn(t *testing.T, ns netns.NsHandle, f func() error) error {
 	if err != nil {
 		t.Fatalf("netns.Get: %v", err)
 	}
-	defer orig.Close()
+	defer func() { _ = orig.Close() }()
 	if err := netns.Set(ns); err != nil {
 		t.Fatalf("netns.Set: %v", err)
 	}
@@ -167,7 +167,7 @@ func dial(t *testing.T, ns netns.NsHandle, addr string) (answer, error) {
 	if err != nil {
 		return answer{}, err
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	_ = conn.SetReadDeadline(time.Now().Add(serverTimeout))
 	line, err := bufio.NewReader(conn).ReadString('\n')
 	if err != nil {
@@ -337,7 +337,7 @@ func echo(t *testing.T, ns netns.NsHandle) {
 				return
 			}
 			go func() {
-				defer c.Close()
+				defer func() { _ = c.Close() }()
 				r := bufio.NewReader(c)
 				for {
 					line, err := r.ReadString('\n')
@@ -377,7 +377,7 @@ func TestL4DatapathResyncKeepsEstablishedConnections(t *testing.T) {
 		conn, err = net.DialTimeout("tcp4", testVIP+":90", dialTimeout)
 		return err
 	}))
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	r := bufio.NewReader(conn)
 	roundTrip := func(msg string) {
 		t.Helper()
