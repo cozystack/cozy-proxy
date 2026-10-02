@@ -7,6 +7,7 @@ import (
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
 	"github.com/cozystack/cozy-proxy/pkg/controllers"
+	"github.com/cozystack/cozy-proxy/pkg/l4"
 	"github.com/cozystack/cozy-proxy/pkg/proxy"
 
 	"k8s.io/apimachinery/pkg/runtime"
@@ -19,7 +20,9 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 )
 
 var (
@@ -34,8 +37,12 @@ func init() {
 func main() {
 	var probeAddr string
 	var metricsAddr string
+	var enableL4 bool
 	flag.StringVar(&probeAddr, "health-probe-bind-address", "0", "The address the probe endpoint binds to. Set to \"0\" to disable.")
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metric endpoint binds to. Set to \"0\" to disable.")
+	flag.BoolVar(&enableL4, "enable-l4-loadbalancer", false,
+		"Run the L4 LoadBalancer mode for services labelled "+l4.ProxyLabel+"="+l4.ProxyLabelValue+
+			" (see docs/rfc/l4-loadbalancer-mode.md). When false, a table left by an earlier run is removed.")
 	opts := zap.Options{
 		Development: true,
 	}
@@ -53,6 +60,10 @@ func main() {
 		log.Error(err, "unable to start manager")
 		os.Exit(1)
 	}
+
+	// The L4 mode builds its own clients from an untouched copy: the VM mode
+	// pins the shared config to the core group below.
+	l4Cfg := rest.CopyConfig(mgr.GetConfig())
 
 	cfg := mgr.GetConfig()
 	cfg.GroupVersion = &corev1.SchemeGroupVersion
@@ -89,6 +100,8 @@ func main() {
 		os.Exit(1)
 	}
 
+	setupL4(mgr, l4Cfg, enableL4, nodeName)
+
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
 		log.Error(err, "unable to set up health check")
 		os.Exit(1)
@@ -103,4 +116,43 @@ func main() {
 		log.Error(err, "problem running manager")
 		os.Exit(1)
 	}
+}
+
+// setupL4 adds the L4 LoadBalancer mode to the manager, or removes what an
+// earlier run of it left when it is disabled. Nothing here may stop the
+// process: the VM mode runs in the same manager.
+func setupL4(mgr ctrl.Manager, cfg *rest.Config, enabled bool, nodeName string) {
+	datapath := &proxy.NFTL4Datapath{}
+	if !enabled {
+		if err := datapath.Teardown(); err != nil {
+			log.Error(err, "could not remove the L4 table left by an earlier run")
+		}
+		return
+	}
+	if nodeName == "" {
+		log.Error(nil, "the L4 LoadBalancer mode needs NODE_NAME to tell which backends are local; not starting it")
+		return
+	}
+
+	clientset, err := kubernetes.NewForConfig(cfg)
+	if err != nil {
+		log.Error(err, "failed to create the L4 clientset; not starting the L4 mode")
+		return
+	}
+	dyn, err := dynamic.NewForConfig(cfg)
+	if err != nil {
+		log.Error(err, "failed to create the L4 dynamic client; not starting the L4 mode")
+		return
+	}
+	if err := mgr.Add(&controllers.L4Controller{
+		Clientset: clientset,
+		Dynamic:   dyn,
+		NodeName:  nodeName,
+		Datapath:  datapath,
+		Conntrack: &proxy.NetlinkConntrack{},
+	}); err != nil {
+		log.Error(err, "unable to add the L4 controller to the manager")
+		return
+	}
+	log.Info("L4 LoadBalancer mode enabled")
 }
