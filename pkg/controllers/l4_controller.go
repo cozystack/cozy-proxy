@@ -168,16 +168,19 @@ func (c *L4Controller) run(ctx context.Context) {
 	defer resync.Stop()
 	var retry <-chan time.Time
 
-	force := true // the first pass replaces whatever the previous instance left
+	// The first pass replaces whatever the previous instance left. A forced
+	// pass stays forced until it succeeds: retried as an ordinary one, it would
+	// find the desired state unchanged and skip the commit it exists for.
+	force := true
 	for {
 		if err := c.syncWith(c.input(), force); err != nil {
 			l4log.Error(err, "L4 sync failed, retrying")
 			retry = time.After(orDefault(c.RetryInterval, defaultL4RetryInterval))
 		} else {
 			retry = nil
+			force = false
 		}
 
-		force = false
 		select {
 		case <-ctx.Done():
 			return

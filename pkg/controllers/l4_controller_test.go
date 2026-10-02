@@ -28,6 +28,12 @@ type fakeL4Datapath struct {
 	failing bool
 }
 
+func (f *fakeL4Datapath) setFailing(v bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.failing = v
+}
+
 func (f *fakeL4Datapath) Sync(st l4.State) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -373,4 +379,34 @@ func TestL4ControllerWithoutNodeNameProgramsNothing(t *testing.T) {
 	if dp.count() != 0 {
 		t.Errorf("nothing may be programmed without a node name, got %d syncs", dp.count())
 	}
+}
+
+// A forced pass — the first one, or the periodic resync that restores a table
+// altered by hand — must stay forced until it succeeds. Retried as an ordinary
+// pass, it would find the desired state unchanged and skip the commit.
+func TestL4RunKeepsForcingUntilAForcedPassSucceeds(t *testing.T) {
+	in := l4Input(l4Slice("pg", "10.0.0.1"))
+	st, _ := l4.Build(in)
+	dp := &fakeL4Datapath{failing: true}
+	c := &L4Controller{
+		NodeName:        l4Node,
+		Datapath:        dp,
+		Conntrack:       &fakePurger{},
+		MinSyncInterval: time.Millisecond,
+		RetryInterval:   5 * time.Millisecond,
+		ResyncInterval:  time.Hour,
+		applied:         &st, // what the datapath last committed, as far as we know
+		dirty:           make(chan struct{}, 1),
+		input:           func() l4.Input { return in },
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { c.run(ctx); close(done) }()
+	defer func() { cancel(); <-done }()
+
+	time.Sleep(30 * time.Millisecond)
+	dp.setFailing(false)
+	waitFor(t, dp, "the forced pass committed on retry", func(got l4.State) bool {
+		return reflect.DeepEqual(got, st)
+	})
 }
