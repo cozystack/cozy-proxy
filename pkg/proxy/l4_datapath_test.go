@@ -318,3 +318,82 @@ func isTimeout(err error) bool {
 	var ne net.Error
 	return errors.As(err, &ne) && ne.Timeout()
 }
+
+// echo serves a line-echo on port 9090 of the backends, keeping each
+// connection open until the client closes it.
+func echo(t *testing.T, ns netns.NsHandle) {
+	t.Helper()
+	var ln net.Listener
+	must(t, "listen", doIn(t, ns, func() error {
+		var err error
+		ln, err = net.Listen("tcp4", "0.0.0.0:9090")
+		return err
+	}))
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer c.Close()
+				r := bufio.NewReader(c)
+				for {
+					line, err := r.ReadString('\n')
+					if err != nil {
+						return
+					}
+					if _, err := c.Write([]byte(line)); err != nil {
+						return
+					}
+				}
+			}()
+		}
+	}()
+}
+
+// Every sync rebuilds the table, and a restarted instance does the same on its
+// first pass. A connection established before must keep flowing: its
+// translation lives in conntrack, not in the rules.
+func TestL4DatapathResyncKeepsEstablishedConnections(t *testing.T) {
+	tp := newTopology(t)
+	echo(t, tp.server)
+	dp := datapathIn(tp.router)
+	st := l4.State{
+		VIPs:  []netip.Addr{a(testVIP)},
+		Ports: []l4.PortKey{pk(testVIP, v1.ProtocolTCP, 90)},
+		Rules: []l4.Rule{{
+			PortKey:  pk(testVIP, v1.ProtocolTCP, 90),
+			Service:  "ns/echo",
+			Backends: []l4.Backend{bk(backendA, 9090)},
+		}},
+	}
+	must(t, "Sync", dp.Sync(st))
+
+	var conn net.Conn
+	must(t, "dial", doIn(t, tp.client, func() error {
+		var err error
+		conn, err = net.DialTimeout("tcp4", testVIP+":90", dialTimeout)
+		return err
+	}))
+	defer conn.Close()
+	r := bufio.NewReader(conn)
+	roundTrip := func(msg string) {
+		t.Helper()
+		_ = conn.SetDeadline(time.Now().Add(serverTimeout))
+		if _, err := conn.Write([]byte(msg + "\n")); err != nil {
+			t.Fatalf("write %q: %v", msg, err)
+		}
+		got, err := r.ReadString('\n')
+		if err != nil || got != msg+"\n" {
+			t.Fatalf("echo of %q = %q, %v", msg, got, err)
+		}
+	}
+
+	roundTrip("before")
+	for i := 0; i < 3; i++ {
+		must(t, "re-Sync", dp.Sync(st))
+	}
+	roundTrip("after")
+}
