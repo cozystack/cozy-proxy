@@ -114,7 +114,8 @@ func (d *NFTL4Datapath) Teardown() error {
 //	chain masq   nat postrouting srcnat-5
 //	  ct status dnat ip saddr @node_ips ip daddr . meta l4proto . th dport @backends masquerade
 func buildL4Table(conn *nftables.Conn, t *nftables.Table, st l4.State) error {
-	vips := &nftables.Set{Table: t, Name: "vips", KeyType: nftables.TypeIPAddr}
+	var ids setIDs
+	vips := &nftables.Set{Table: t, ID: ids.next(), Name: "vips", KeyType: nftables.TypeIPAddr}
 	if err := conn.AddSet(vips, addrElements(st.VIPs)); err != nil {
 		return fmt.Errorf("could not add set %s: %w", vips.Name, err)
 	}
@@ -123,7 +124,7 @@ func buildL4Table(conn *nftables.Conn, t *nftables.Table, st l4.State) error {
 	if err != nil {
 		return fmt.Errorf("could not build vip_ports key type: %w", err)
 	}
-	vipPorts := &nftables.Set{Table: t, Name: "vip_ports", KeyType: portKeyType, Concatenation: true}
+	vipPorts := &nftables.Set{Table: t, ID: ids.next(), Name: "vip_ports", KeyType: portKeyType, Concatenation: true}
 	var portElems []nftables.SetElement
 	for _, pk := range st.Ports {
 		portElems = append(portElems, nftables.SetElement{
@@ -134,7 +135,7 @@ func buildL4Table(conn *nftables.Conn, t *nftables.Table, st l4.State) error {
 		return fmt.Errorf("could not add set %s: %w", vipPorts.Name, err)
 	}
 
-	nodeIPs := &nftables.Set{Table: t, Name: "node_ips", KeyType: nftables.TypeIPAddr}
+	nodeIPs := &nftables.Set{Table: t, ID: ids.next(), Name: "node_ips", KeyType: nftables.TypeIPAddr}
 	if err := conn.AddSet(nodeIPs, addrElements(st.NodeIPs)); err != nil {
 		return fmt.Errorf("could not add set %s: %w", nodeIPs.Name, err)
 	}
@@ -145,7 +146,7 @@ func buildL4Table(conn *nftables.Conn, t *nftables.Table, st l4.State) error {
 	// but github.com/google/nftables v0.3.0 can only emit it with the generic
 	// conntrack key, which nft then fails to decode: "nft list" aborts on the
 	// whole ruleset, which is too high a price for every operator on the node.
-	backends := &nftables.Set{Table: t, Name: "backends", KeyType: portKeyType, Concatenation: true}
+	backends := &nftables.Set{Table: t, ID: ids.next(), Name: "backends", KeyType: portKeyType, Concatenation: true}
 	var backendElems []nftables.SetElement
 	seen := map[l4.Backend]bool{}
 	for _, r := range st.Rules {
@@ -201,7 +202,7 @@ func buildL4Table(conn *nftables.Conn, t *nftables.Table, st l4.State) error {
 			// the packet loop through the gateway.
 			exprs = append(exprs, &expr.Verdict{Kind: expr.VerdictDrop})
 		} else {
-			m, err := addBackendMap(conn, t, r)
+			m, err := addBackendMap(conn, t, r, ids.next())
 			if err != nil {
 				return err
 			}
@@ -264,16 +265,30 @@ func buildL4Table(conn *nftables.Conn, t *nftables.Table, st l4.State) error {
 	return nil
 }
 
+// setIDs hands out the set IDs of one transaction, which the rules use to
+// reference sets created in the same batch. github.com/google/nftables would
+// draw them from a package-level counter guarded only by each connection's own
+// lock, so the VM mode queueing its sets on its connection at the same moment
+// could give two of ours the same ID, and a rule would then point at the wrong
+// set. The kernel only needs them unique within a batch.
+type setIDs uint32
+
+func (n *setIDs) next() uint32 {
+	*n++
+	return uint32(*n)
+}
+
 // addBackendMap adds the map from round-robin slot to backend for one frontend.
 // It is named after the frontend, which is unique, and commented with the
 // service it belongs to.
-func addBackendMap(conn *nftables.Conn, t *nftables.Table, r l4.Rule) (*nftables.Set, error) {
+func addBackendMap(conn *nftables.Conn, t *nftables.Table, r l4.Rule, id uint32) (*nftables.Set, error) {
 	dataType, err := nftables.ConcatSetType(nftables.TypeIPAddr, nftables.TypeInetService)
 	if err != nil {
 		return nil, fmt.Errorf("could not build backend map data type: %w", err)
 	}
 	m := &nftables.Set{
 		Table:    t,
+		ID:       id,
 		Name:     fmt.Sprintf("backends-%s-%s-%d", r.VIP, protoName(r.Protocol), r.Port),
 		Comment:  r.Service,
 		IsMap:    true,

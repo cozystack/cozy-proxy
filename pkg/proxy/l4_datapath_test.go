@@ -290,14 +290,28 @@ func TestL4DatapathPurgesWithdrawnBackend(t *testing.T) {
 		}
 	}
 
+	gone := netip.AddrPortFrom(a(backendB), backendPort)
+	before := 0
+	for _, f := range listFlows(t, ct.Handle) {
+		if f.ReplySrc == gone {
+			before++
+		}
+	}
+	if before == 0 {
+		t.Fatal("no flow towards the backend about to be withdrawn: the test would prove nothing")
+	}
+
 	cur := routerState()
 	cur.Rules[0].Backends = []l4.Backend{bk(backendA, backendPort)}
 	must(t, "Sync", dp.Sync(cur))
-	if _, err := ct.Purge(l4.StaleFlows(&prev, cur)); err != nil {
+	n, err := ct.Purge(l4.StaleFlows(&prev, cur))
+	if err != nil {
 		t.Fatalf("Purge: %v", err)
 	}
+	if int(n) != before {
+		t.Errorf("Purge deleted %d flows, want the %d towards the withdrawn backend", n, before)
+	}
 
-	gone := netip.AddrPortFrom(a(backendB), backendPort)
 	for _, f := range listFlows(t, ct.Handle) {
 		if f.ReplySrc == gone {
 			t.Errorf("a flow towards the withdrawn backend survived: %+v", f)

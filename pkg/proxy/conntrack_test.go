@@ -73,7 +73,7 @@ func TestNetlinkConntrackPurgeDeletesSelectedFlowsOnly(t *testing.T) {
 
 	createFlow(t, h, "198.51.100.7:40001", "192.0.2.10:80", "10.244.0.10:8080")   // backend kept
 	createFlow(t, h, "198.51.100.7:40002", "192.0.2.10:80", "10.244.0.11:8080")   // backend gone
-	createFlow(t, h, "198.51.100.7:40003", "203.0.113.5:443", "10.244.0.11:8443") // not a VIP
+	createFlow(t, h, "198.51.100.7:40003", "203.0.113.5:443", "10.244.0.11:8443") // same backend IP, other port
 
 	gone := netip.MustParseAddrPort("10.244.0.11:8080")
 	purger := &NetlinkConntrack{Handle: h}
