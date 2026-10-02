@@ -435,8 +435,18 @@ proposed) refuses, on CREATE and UPDATE, any Service carrying
 `cluster.x-k8s.io/tenant-service-name` that has `spec.externalIPs` or one of a
 list of MetalLB, external-dns and Cilium annotations, `service.cilium.io/type`
 included: a tenant must not drive them through the CCM's copy. As proposed, it
-would refuse every L4 CCM Service — at creation, and on every later UPDATE, the
-CCM's own port updates and the one-shot migration patch included.
+refuses an L4 CCM Service at creation, and refuses the one-shot migration patch,
+which turns a compliant Service into a violating one.
+
+It does not refuse the UPDATEs that follow. Kyverno admits any UPDATE of an
+object that already violates the rule (`validate.allowExistingViolations`,
+`true` by default; verified on the lab with 1.18.2): the CCM's own port updates
+pass, but so does an UPDATE that adds another refused key. On the lab, an L4
+CCM Service, violating through its `service.cilium.io/type`, accepted
+`service.cilium.io/node` on UPDATE, and another CCM Service already carried a
+copied `metallb.io/loadBalancerIPs`. The narrowed rule below closes that hole for
+L4 Services: with the label and `ClusterIP`, they are compliant, so every later
+UPDATE is validated in full.
 
 The two are reconciled by narrowing that one key rather than dropping it:
 
@@ -565,9 +575,11 @@ another tenant, the source IP logged by the backend, MetalLB announcer, and the
 9. **Observability**: metrics (sync duration and errors, programmed services,
    purged flows) and Events on the Service when it is refused. Phase 1 only
    logs, once per change.
-10. **Kyverno guard (7.1)**: the narrowed rule is a sketch; it has to be agreed
-    with the owners of hikube-gitops !121 and tested on the lab, on CREATE and on
-    the CCM's UPDATE.
+10. **Kyverno guard (7.1)**: the narrowed rule was tested on the lab on
+    2026-10-02 (Kyverno 1.18.2): a real CCM CREATE and port UPDATE, the
+    migration patch, a tenant copy without the label, another
+    `service.cilium.io/*` key, and the rollback in both orders. It still has to
+    be agreed with the owners of hikube-gitops !121.
 11. **Where the label lives**: `networking.cozystack.io/lb-proxy: cozy-proxy` is a
     proposal; the maintainers may prefer another key.
 12. **Purging the TCP flows of a backend that is still alive — decided.** Aligned
