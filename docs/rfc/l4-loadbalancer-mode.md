@@ -565,7 +565,15 @@ another tenant, the source IP logged by the backend, MetalLB announcer, and the
     the CCM's UPDATE.
 11. **Where the label lives**: `networking.cozystack.io/lb-proxy: cozy-proxy` is a
     proposal; the maintainers may prefer another key.
-12. **`google/nftables` limits**: no `typeof` on sets, and no direction on the
+12. **Purging the TCP flows of a backend that is still alive.** On the lab, a
+    backend taken out of the Service (label removed) while a request was in
+    flight lost its flow at the purge, and the client, idle while waiting for
+    the answer, hung until its own timeout: the backend's reply no longer
+    matched any conntrack entry, and no RST reached the client. kube-proxy
+    does not purge TCP flows on endpoint removal; it only does so for UDP.
+    Should the L4 mode purge only UDP, and TCP only when the service, the
+    port or the announcement goes?
+13. **`google/nftables` limits**: no `typeof` on sets, and no direction on the
     typed conntrack keys (3.1). Both are cosmetic for `nft list` today; fixing
     them upstream would let the masquerade match the original destination.
 
@@ -592,5 +600,26 @@ docker run --rm --privileged -v "$PWD":/src -w /src golang:1.26 sh -c \
 ```
 
 Not in phase 1: UDP, eTP `Cluster`, IPv6, terminating endpoints, metrics and
-Events, and a lab validation of the binary itself (the model was validated with
-hand-written rules).
+Events.
+
+Lab run on 2026-10-02 (image built from `181b41c`, as a second release with the
+VM mode off, next to the platform's cozy-proxy):
+
+| Case | Result | Source seen by the backend |
+|---|---|---|
+| Internet, both ports (port translation 80 -> 8080, 81 -> 9090) | OK | the client's public IP |
+| pods on the 3 nodes, another tenant | OK | `100.64.0.x` of the announcer |
+| VM-mode client on another node, and on the announcer | OK | the VM's public IP |
+| round-robin between the announcer's two local backends | OK | |
+| undeclared port, ping (tcpdump on the announcer and on another node) | dropped, no packet sent back out | |
+| CIDR deny `0.0.0.0/0 except <client>` on the backend | pods and VM refused, the allowed client passes | |
+| backend withdrawn | its flows purged, new connections go to the others | |
+| announcer moved by MetalLB | one failed probe out of ~110 (0.5 s interval) | |
+| rollout restart of the DaemonSet | open connection kept, 0 failed probes out of 113 | |
+| Postgres app, psql from pods, VM and VPN; `pg_stat_activity` | OK | `100.64.0.x`, VM IP, VPN address |
+| CNPG switchover | ~7 s unavailable, mostly the server shutting down | |
+| rollback (annotation removed) | Cilium serves the VIP again, other tenants refused again | |
+
+Two bugs were found and fixed: a chain named after an nft keyword (`dnat`),
+which nft could not name on the command line, and a misleading logger name.
+
