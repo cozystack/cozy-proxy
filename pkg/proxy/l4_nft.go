@@ -112,7 +112,7 @@ func (d *NFTL4Datapath) Teardown() error {
 //	  ip daddr V tcp dport P dnat ip addr . port to numgen inc mod N map @backends-...
 //	  ip daddr V tcp dport P drop             (announced port with no local backend)
 //	chain masq   nat postrouting srcnat-5
-//	  ct status dnat ip saddr @node_ips ip daddr . meta l4proto . th dport @backends masquerade
+//	  ct status dnat ip saddr @node_ips ip daddr . meta l4proto . th dport @backends masquerade fully-random
 func buildL4Table(conn *nftables.Conn, t *nftables.Table, st l4.State) error {
 	var ids setIDs
 	vips := &nftables.Set{Table: t, ID: ids.next(), Name: "vips", KeyType: nftables.TypeIPAddr}
@@ -246,6 +246,13 @@ func buildL4Table(conn *nftables.Conn, t *nftables.Table, st l4.State) error {
 	//
 	// "ct status dnat" restricts it to translated flows, so a node process
 	// talking to a backend pod directly (a kubelet probe) keeps its source.
+	//
+	// The source port is drawn fully at random. By default the kernel keeps
+	// the client's port whenever its own conntrack has the tuple free, but it
+	// cannot see OVS's: every client of a node collapses onto one masqueraded
+	// address, and under load the announcer reused a tuple OVS still tracked,
+	// 29 to 50 s after the previous connection. OVN dropped the backend's
+	// SYN-ACK and the client retransmitted a second later.
 	conn.AddRule(&nftables.Rule{Table: t, Chain: masq, Exprs: []expr.Any{
 		&expr.Ct{Register: 1, Key: expr.CtKeySTATUS},
 		&expr.Bitwise{
@@ -262,7 +269,7 @@ func buildL4Table(conn *nftables.Conn, t *nftables.Table, st l4.State) error {
 		&expr.Meta{Key: expr.MetaKeyL4PROTO, Register: unix.NFT_REG32_01},
 		&expr.Payload{DestRegister: unix.NFT_REG32_02, Base: expr.PayloadBaseTransportHeader, Offset: 2, Len: 2},
 		&expr.Lookup{SourceRegister: unix.NFT_REG32_00, SetName: backends.Name, SetID: backends.ID},
-		&expr.Masq{},
+		&expr.Masq{FullyRandom: true},
 	}})
 	return nil
 }

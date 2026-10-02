@@ -13,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/google/nftables"
+	"github.com/google/nftables/expr"
 	"github.com/vishvananda/netns"
 	v1 "k8s.io/api/core/v1"
 
@@ -256,5 +257,41 @@ func TestL4ChainsCanBeListedByName(t *testing.T) {
 		if out, err := inNetns(t, ns, nft, "list", "chain", "ip", L4TableName, ch.Name); err != nil {
 			t.Errorf("nft list chain %s: %v\n%s", ch.Name, err, out)
 		}
+	}
+}
+
+// The masquerade of node sources must pick a fully random source port. By
+// default the kernel keeps the client's port whenever its own conntrack has
+// the tuple free, and on the lab that made the announcer reuse a
+// 100.64.0.x:<port> tuple 29 to 50 s after a previous connection, while OVS
+// still tracked it: the backend's SYN-ACK was dropped in OVN and the client
+// retransmitted, 0.06 to 0.1 % of connections taking over a second.
+func TestL4MasqueradeIsFullyRandom(t *testing.T) {
+	ns := scratchNetns(t)
+	if err := datapathIn(ns).Sync(announcerState); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	conn, err := nftables.New(nftables.WithNetNSFd(int(ns)))
+	if err != nil {
+		t.Fatalf("nftables.New: %v", err)
+	}
+	table := &nftables.Table{Family: nftables.TableFamilyIPv4, Name: L4TableName}
+	rules, err := conn.GetRules(table, &nftables.Chain{Name: "masq", Table: table})
+	if err != nil {
+		t.Fatalf("GetRules: %v", err)
+	}
+	var masqs []*expr.Masq
+	for _, r := range rules {
+		for _, e := range r.Exprs {
+			if m, ok := e.(*expr.Masq); ok {
+				masqs = append(masqs, m)
+			}
+		}
+	}
+	if len(masqs) != 1 {
+		t.Fatalf("want one masquerade in chain masq, got %d", len(masqs))
+	}
+	if !masqs[0].FullyRandom {
+		t.Errorf("the masquerade keeps the client's source port; want fully-random, got %+v", *masqs[0])
 	}
 }

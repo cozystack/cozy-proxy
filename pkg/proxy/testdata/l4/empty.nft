@@ -27,6 +27,6 @@ table ip cozy_proxy_l4 {
 
 	chain masq {
 		type nat hook postrouting priority srcnat - 5; policy accept;
-		ct status dnat ip saddr @node_ips ip daddr . meta l4proto . th dport @backends masquerade
+		ct status dnat ip saddr @node_ips ip daddr . meta l4proto . th dport @backends masquerade fully-random
 	}
 }
