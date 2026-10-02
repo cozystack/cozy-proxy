@@ -90,3 +90,10 @@ type L4Datapath interface {
 	// Teardown removes everything the L4 mode programs. No-op if absent.
 	Teardown() error
 }
+
+// ConntrackPurger deletes conntrack entries.
+type ConntrackPurger interface {
+	// Purge deletes the IPv4 entries stale selects and returns how many
+	// were deleted.
+	Purge(stale func(l4.Flow) bool) (uint, error)
+}
