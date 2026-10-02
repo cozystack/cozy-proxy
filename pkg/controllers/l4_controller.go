@@ -16,12 +16,16 @@ import (
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
+	ctrl "sigs.k8s.io/controller-runtime"
 
 	"github.com/cozystack/cozy-proxy/pkg/l4"
 	nat "github.com/cozystack/cozy-proxy/pkg/proxy"
 )
 
-var l4log = log.WithName("l4")
+// l4log is not derived from the VM controller's logger: named
+// "services-controller.l4", its lines read as if the VM mode were doing the
+// work, which is confusing when both modes run in one process.
+var l4log = ctrl.Log.WithName("l4-controller")
 
 // serviceL2StatusGVR is MetalLB's record of which node announces a service in
 // L2 mode. Each speaker writes one per service it announces, labelled with its
