@@ -17,3 +17,9 @@ rbac:
 # Disabling it removes the table it programmed on the next start.
 l4LoadBalancer:
   enabled: false
+
+# VM mode, for services labelled service.kubernetes.io/service-proxy-name=cozy-proxy.
+# Turn it off only to run the L4 mode as a second release next to a cozy-proxy
+# that keeps the VM mode, for instance to try the L4 mode on a live cluster.
+vmMode:
+  enabled: true

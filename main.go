@@ -38,11 +38,15 @@ func main() {
 	var probeAddr string
 	var metricsAddr string
 	var enableL4 bool
+	var enableVM bool
 	flag.StringVar(&probeAddr, "health-probe-bind-address", "0", "The address the probe endpoint binds to. Set to \"0\" to disable.")
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metric endpoint binds to. Set to \"0\" to disable.")
 	flag.BoolVar(&enableL4, "enable-l4-loadbalancer", false,
 		"Run the L4 LoadBalancer mode for services labelled "+l4.ProxyLabel+"="+l4.ProxyLabelValue+
 			" (see docs/rfc/l4-loadbalancer-mode.md). When false, a table left by an earlier run is removed.")
+	flag.BoolVar(&enableVM, "enable-vm-mode", true,
+		"Run the VM mode for services labelled service.kubernetes.io/service-proxy-name=cozy-proxy. "+
+			"Turn it off only for an instance running the L4 mode next to another cozy-proxy that keeps the VM mode.")
 	opts := zap.Options{
 		Development: true,
 	}
@@ -89,15 +93,21 @@ func main() {
 			"set it from spec.nodeName to scope rules to this node")
 	}
 
-	controller := &controllers.ServicesController{
-		Clientset: clientset,
-		Proxy:     &proxy.NFTProxyProcessor{},
-		NodeName:  nodeName,
-	}
+	if enableVM {
+		controller := &controllers.ServicesController{
+			Clientset: clientset,
+			Proxy:     &proxy.NFTProxyProcessor{},
+			NodeName:  nodeName,
+		}
 
-	if err := mgr.Add(controller); err != nil {
-		log.Error(err, "unable to add endpoints controller to manager")
-		os.Exit(1)
+		if err := mgr.Add(controller); err != nil {
+			log.Error(err, "unable to add endpoints controller to manager")
+			os.Exit(1)
+		}
+	} else {
+		// Another instance owns the cozy_proxy table: leave it alone, the VM
+		// mode's startup would rebuild its chains and purge its maps.
+		log.Info("VM mode disabled, the cozy_proxy table is left untouched")
 	}
 
 	setupL4(mgr, l4Cfg, enableL4, nodeName)
