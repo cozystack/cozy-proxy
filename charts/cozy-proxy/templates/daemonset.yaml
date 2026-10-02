@@ -21,6 +21,23 @@ spec:
         - name: cozy-proxy
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- if or .Values.l4LoadBalancer.enabled (not .Values.vmMode.enabled) }}
+          args:
+            {{- if .Values.l4LoadBalancer.enabled }}
+            - --enable-l4-loadbalancer
+            {{- end }}
+            {{- if not .Values.vmMode.enabled }}
+            - --enable-vm-mode=false
+            {{- end }}
+          {{- end }}
+          env:
+            # Scopes the ingress rules to the backends hosted on this node; see
+            # "Rule scoping" in the README for why a non-hosting node must not
+            # program them.
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
           securityContext:
             privileged: true
             capabilities:
