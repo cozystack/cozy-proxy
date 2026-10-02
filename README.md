@@ -85,6 +85,34 @@ watches every Service, but programs:
 everything is programmed everywhere, so the binary still runs under a
 deployment that does not inject it.
 
+## L4 LoadBalancer mode (experimental)
+
+Besides VMs, cozy-proxy can take over the public IP of ordinary `LoadBalancer`
+services — several ports, several backends, port translation — so that it is
+reachable from every pod the way it is from the Internet. A service opts in with
+both:
+
+```yaml
+metadata:
+  labels:
+    networking.cozystack.io/lb-proxy: cozy-proxy
+  annotations:
+    service.cilium.io/type: ClusterIP   # Cilium releases the VIP, keeps the ClusterIP
+spec:
+  type: LoadBalancer
+  externalTrafficPolicy: Local
+```
+
+The node MetalLB (L2) announces the VIP from DNATs new connections to its local
+ready backends, masquerading only sources that are node IPs; everything else
+addressed to the VIP is dropped. The mode has its own table, `ip
+cozy_proxy_l4`, and never touches the VM mode's. It is off by default: run with
+`--enable-l4-loadbalancer` (chart value `l4LoadBalancer.enabled`). Phase 1
+handles TCP, IPv4 and `externalTrafficPolicy: Local`.
+
+See [the RFC](docs/rfc/l4-loadbalancer-mode.md) for the model, the datapath,
+the security implications and the rollout plan.
+
 ## Installation
 
 Install controller using Helm-chart:

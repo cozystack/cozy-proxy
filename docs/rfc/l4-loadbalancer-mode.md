@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | Draft, prototype on branch `feat/l4-loadbalancer` |
+| Status | Draft. Phase 1 prototype on branch `feat/l4-loadbalancer` (section 11) |
 | Scope | cozy-proxy, plus the Cozystack charts that would opt services in |
 | Supersedes | nothing; the existing VM mode is unchanged |
 
@@ -189,6 +189,8 @@ table ip cozy_proxy_l4 {
 	set vip_ports { type ipv4_addr . inet_proto . inet_service }
 	# InternalIP of every Node.
 	set node_ips { type ipv4_addr }
+	# (backend IP, protocol, backend port) of every local target, announcer only.
+	set backends { type ipv4_addr . inet_proto . inet_service }
 	# One map per announced service port: round-robin slot -> backend.
 	map backends-<ns>/<svc>/tcp/<port> { type integer : ipv4_addr . inet_service }
 
@@ -208,7 +210,7 @@ table ip cozy_proxy_l4 {
 
 	chain masq {
 		type nat hook postrouting priority srcnat - 5; policy accept;
-		ct status dnat ip saddr @node_ips ct original ip daddr @vips masquerade
+		ct status dnat ip saddr @node_ips ip daddr . meta l4proto . th dport @backends masquerade
 	}
 }
 ```
@@ -221,9 +223,18 @@ Notes:
   port) are dropped, which includes ICMP echo: nobody would answer it anyway.
 - `dnat` only holds rules on the announcer. Elsewhere the packet is left alone
   and routed out, to the announcer.
-- `masq` only matches flows this node translated (`ct status dnat`) towards a
-  VIP, from a node IP. The masquerade picks the address of the interface towards
-  the backend, `ovn0` on kube-ovn, hence the `100.64.0.x` source.
+- `masq` only matches flows this node translated (`ct status dnat`) towards one
+  of its L4 targets, from a node IP, so a node process talking to a backend pod
+  directly (a kubelet probe) keeps its source. The masquerade picks the address
+  of the interface towards the backend, `ovn0` on kube-ovn, hence the
+  `100.64.0.x` source. nft itself would match `ct original ip daddr @vips`;
+  `github.com/google/nftables` can only emit that with the generic conntrack
+  key, which makes `nft list` abort on the whole ruleset, hence the match on the
+  translated destination.
+- `nft list` shows the backend maps as `type 0 : ipv4_addr . inet_service`: nft
+  only names an integer key through a `typeof` annotation, which
+  `github.com/google/nftables` cannot write. The elements are listed correctly
+  and the kernel does not look at either.
 - `numgen inc` is per node and per rule, which is enough: only one node
   translates a given VIP.
 
@@ -290,10 +301,10 @@ it the mode refuses to start rather than program every node.
 ### 4.2 Reconciliation
 
 Level-triggered. Every informer event only marks the state dirty. A single sync
-loop, rate-limited, recomputes the desired state from the informer caches and
-applies it as one transaction (3.3). A failed sync stays dirty and is retried
-on the next tick; a periodic resync re-applies the state even without events, so
-a table deleted by hand comes back.
+loop recomputes the desired state from the informer caches, coalescing bursts
+(250 ms), and applies it as one transaction (3.3) when it changed. A failed pass
+is retried after 5 s; a periodic resync (1 min) re-applies the state even
+without events, so a table deleted or altered by hand comes back.
 
 The first sync waits for every informer to be synced. Until then the table left
 by the previous instance stays in place and keeps forwarding.
@@ -324,8 +335,12 @@ commit, so no new flow can be created towards a backend that was just purged.
   update therefore does not interrupt traffic: the old rules keep forwarding until
   the new instance's first sync replaces them atomically. Changes that happen
   during the gap are applied with that delay, as with kube-proxy.
-- Disabling the mode (flag off) deletes the table at startup, which is the
-  rollback path for the whole mode.
+- The mode is behind `--enable-l4-loadbalancer` (chart:
+  `l4LoadBalancer.enabled`), off by default. Disabling it deletes the table at
+  startup, which is the rollback path for the whole mode.
+- Nothing on the L4 side stops the process: the VM mode runs in the same
+  manager. Without `NODE_NAME`, or while the MetalLB CRD is missing, the mode
+  logs and stays idle.
 
 ### 4.5 Announcer changes
 
@@ -459,6 +474,36 @@ another tenant, the source IP logged by the backend, MetalLB announcer, and the
    traffic for the PROXY-protocol host ingress. Its interaction with a VIP that
    Cilium no longer owns has to be checked before step 3.
 9. **Observability**: metrics (sync duration and errors, programmed services,
-   purged flows) and Events on the Service when it is refused.
+   purged flows) and Events on the Service when it is refused. Phase 1 only
+   logs, once per change.
 10. **Where the label lives**: `networking.cozystack.io/lb-proxy: cozy-proxy` is a
     proposal; the maintainers may prefer another key.
+11. **`google/nftables` limits**: no `typeof` on sets, and no direction on the
+    typed conntrack keys (3.1). Both are cosmetic for `nft list` today; fixing
+    them upstream would let the masquerade match the original destination.
+
+## 11. Prototype status
+
+Branch `feat/l4-loadbalancer`, phase 1 only:
+
+| Area | Where | Tests |
+|---|---|---|
+| Selection (2.5) | `pkg/l4/select.go` | unit |
+| Desired state per node (4.1) | `pkg/l4/state.go` | unit |
+| Purge decision (4.3) | `pkg/l4/conntrack.go` | unit |
+| nftables table (3) | `pkg/proxy/l4_nft.go` | kernel, in a network namespace: `nft list` against golden files, and real TCP traffic through three namespaces (translation, round-robin, source kept or masqueraded, guard, port without backend, purge, rebuild with an open connection) |
+| Conntrack purge | `pkg/proxy/conntrack.go` | kernel, in a network namespace |
+| Controller (4.2) | `pkg/controllers/l4_controller.go` | unit, and fake API clients |
+| Switch and RBAC | `main.go`, chart `l4LoadBalancer.enabled` | `helm template` |
+
+The kernel tests need root and skip otherwise; `nft list` comparisons also need
+the `nft` binary. They run in a privileged Linux container, for instance:
+
+```
+docker run --rm --privileged -v "$PWD":/src -w /src golang:1.26 sh -c \
+  'apt-get update -qq && apt-get install -y -qq nftables && go test ./...'
+```
+
+Not in phase 1: UDP, eTP `Cluster`, IPv6, terminating endpoints, metrics and
+Events, and a lab validation of the binary itself (the model was validated with
+hand-written rules).
