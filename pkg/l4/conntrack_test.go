@@ -119,8 +119,8 @@ func TestProtocolNumber(t *testing.T) {
 	}
 }
 
-// A backend that stops being ready keeps its live connections until it leaves
-// the EndpointSlice; only then are they purged.
+// A terminating backend keeps its live connections until it leaves the
+// EndpointSlice; only then are they purged.
 func TestDrainingBackendKeepsItsFlows(t *testing.T) {
 	ready := stateWith(rule("192.0.2.10", 80, be("10.0.0.1", 8080), be("10.0.0.2", 8080)))
 	draining := stateWith(rule("192.0.2.10", 80, be("10.0.0.1", 8080)))

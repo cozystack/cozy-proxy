@@ -35,10 +35,12 @@ type Rule struct {
 	// Service is the namespace/name of the Service the frontend belongs to.
 	Service  string
 	Backends []Backend
-	// Draining are local endpoints still listed but not ready, or
-	// terminating. They get no new connection, but their live ones are not
-	// purged: a backend shutting down gracefully must be able to finish them,
-	// as it would behind kube-proxy or Cilium. The datapath ignores them.
+	// Draining are the local endpoints that are terminating. They get no new
+	// connection, but their live ones are not purged: a backend shutting down
+	// gracefully must be able to finish them, as it would behind kube-proxy or
+	// Cilium. A merely not-ready endpoint is not draining: its probe says it
+	// cannot serve, so its flows are purged like a removed one's. The datapath
+	// ignores this field.
 	Draining []Backend
 }
 
@@ -163,7 +165,7 @@ func (b *builder) addService(svc *v1.Service) {
 }
 
 // localBackends returns the endpoints of the service port hosted on this node,
-// sorted and deduplicated: the ones serving, and the draining ones. The port
+// sorted and deduplicated: the ones serving, and the terminating ones. The port
 // is matched by name and protocol, the way kube-proxy does, which also
 // resolves named target ports.
 func (b *builder) localBackends(key, ns, name, portName string, proto v1.Protocol) (ready, draining []Backend) {
@@ -187,9 +189,10 @@ func (b *builder) localBackends(key, ns, name, portName string, proto v1.Protoco
 				b.notice(key, "backend %s excluded: it is the pod of VM-mode service %s", ip, owner)
 				continue
 			}
-			if serves(ep) {
+			switch {
+			case serves(ep):
 				ready = append(ready, Backend{IP: ip, Port: port})
-			} else {
+			case terminating(ep):
 				draining = append(draining, Backend{IP: ip, Port: port})
 			}
 		}
@@ -237,10 +240,14 @@ func (b *builder) vmModePods() map[netip.Addr]string {
 // not serve even when Ready says true, which publishNotReadyAddresses makes it
 // do.
 func serves(ep discoveryv1.Endpoint) bool {
-	if ep.Conditions.Terminating != nil && *ep.Conditions.Terminating {
+	if terminating(ep) {
 		return false
 	}
 	return ep.Conditions.Ready == nil || *ep.Conditions.Ready
+}
+
+func terminating(ep discoveryv1.Endpoint) bool {
+	return ep.Conditions.Terminating != nil && *ep.Conditions.Terminating
 }
 
 func slicePort(s *discoveryv1.EndpointSlice, name string, proto v1.Protocol) (uint16, bool) {

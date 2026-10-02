@@ -322,14 +322,16 @@ the first sync, the mode deletes the conntrack entries that:
   destination), and
 - target a VIP the mode knows (previous or current state), and
 - point to a (VIP, protocol, port, backend IP, backend port) that is no longer
-  programmed **on this node** — backend gone from the EndpointSlices, port
+  programmed **on this node** — backend gone from the EndpointSlices or not
+  ready, port
   removed, service removed or no longer managed, or this node no longer the
   announcer.
 
-A local endpoint that is still listed but not ready, or terminating, is
-*draining*: it gets no new connection, but its live ones are kept until it
-leaves the slices, so a backend shutting down gracefully (an ingress-nginx
-rolling update) can finish them, as behind kube-proxy or Cilium.
+A local endpoint that is terminating is *draining*: it gets no new
+connection, but its live ones are kept until it leaves the slices, so a backend
+shutting down gracefully (an ingress-nginx rolling update) can finish them, as
+behind kube-proxy or Cilium. An endpoint that is merely not ready is not: its
+probe says it cannot serve, so its flows are purged as if it had been removed.
 
 Untranslated flows towards a VIP (a pod on a non-announcer node passing through)
 are never touched, nor is anything the VM mode tracks. The purge runs after the
