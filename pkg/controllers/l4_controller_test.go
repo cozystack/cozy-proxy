@@ -151,7 +151,14 @@ func flowTo(backend string) l4.Flow {
 // The first sync programs the state Build computes and purges once, since the
 // previous instance may have left translations this one no longer programs.
 func TestL4SyncProgramsAndPurgesOnFirstSync(t *testing.T) {
-	dp, ct := &fakeL4Datapath{}, &fakePurger{flows: []l4.Flow{flowTo("10.0.0.1:5432"), flowTo("10.0.0.9:5432")}}
+	// A flow the previous instance translated through a port the service no
+	// longer has.
+	oldPort := l4.Flow{
+		Protocol: 6,
+		OrigDst:  netip.MustParseAddrPort("192.0.2.10:5433"),
+		ReplySrc: netip.MustParseAddrPort("10.0.0.1:5433"),
+	}
+	dp, ct := &fakeL4Datapath{}, &fakePurger{flows: []l4.Flow{flowTo("10.0.0.1:5432"), flowTo("10.0.0.9:5432"), oldPort}}
 	c := &L4Controller{NodeName: l4Node, Datapath: dp, Conntrack: ct}
 
 	in := l4Input(l4Slice("pg", "10.0.0.1"))
@@ -166,8 +173,10 @@ func TestL4SyncProgramsAndPurgesOnFirstSync(t *testing.T) {
 	if ct.calls != 1 {
 		t.Fatalf("the first sync must purge once, got %d", ct.calls)
 	}
-	if len(ct.purged) != 1 || ct.purged[0] != flowTo("10.0.0.9:5432") {
-		t.Errorf("purged %+v, want only the flow to the backend no longer programmed", ct.purged)
+	// A TCP flow to a frontend still served is kept whatever its backend, as
+	// kube-proxy would.
+	if len(ct.purged) != 1 || ct.purged[0] != oldPort {
+		t.Errorf("purged %+v, want only the flow through the port that is gone", ct.purged)
 	}
 }
 
@@ -196,7 +205,9 @@ func TestL4SyncSkipsUnchangedState(t *testing.T) {
 	}
 }
 
-func TestL4SyncPurgesWhenABackendIsWithdrawn(t *testing.T) {
+// A TCP backend withdrawn from a frontend that remains keeps its connections
+// until they end; its flows only go with the frontend.
+func TestL4SyncPurgesTCPFlowsWithTheirFrontendOnly(t *testing.T) {
 	dp, ct := &fakeL4Datapath{}, &fakePurger{}
 	c := &L4Controller{NodeName: l4Node, Datapath: dp, Conntrack: ct}
 
@@ -213,12 +224,22 @@ func TestL4SyncPurgesWhenABackendIsWithdrawn(t *testing.T) {
 		t.Errorf("adding a backend must not purge, got %d purges", ct.calls)
 	}
 
-	// A backend withdrawn: its flows go.
+	// A backend withdrawn: its connections are left alone.
 	if err := c.syncWith(l4Input(l4Slice("pg", "10.0.0.1", "10.0.0.3")), false); err != nil {
 		t.Fatalf("sync: %v", err)
 	}
-	if ct.calls != 2 || len(ct.purged) != 1 || ct.purged[0] != flowTo("10.0.0.2:5432") {
-		t.Errorf("withdrawing a backend must purge its flows, got %d purges, purged %+v", ct.calls, ct.purged)
+	if ct.calls != 1 || len(ct.purged) != 0 {
+		t.Errorf("withdrawing a TCP backend must not purge, got %d purges, purged %+v", ct.calls, ct.purged)
+	}
+
+	// The node stops announcing the service: every flow through it goes.
+	gone := l4Input(l4Slice("pg", "10.0.0.1", "10.0.0.3"))
+	gone.Announced = nil
+	if err := c.syncWith(gone, false); err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+	if ct.calls != 2 || len(ct.purged) != 2 {
+		t.Errorf("losing the announcement must purge every flow, got %d purges, purged %+v", ct.calls, ct.purged)
 	}
 }
 

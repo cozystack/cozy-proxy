@@ -311,27 +311,32 @@ by the previous instance stays in place and keeps forwarding.
 
 ### 4.3 Conntrack purge
 
-A conntrack entry outlives the rule that created it. When a backend disappears,
-its existing flows would keep being translated to a dead pod until they time out
-(hours for TCP), and UDP flows would never recover.
+A conntrack entry outlives the rule that created it. The purge follows
+kube-proxy. After every successful sync that withdrew something, and once after
+the first sync, the mode deletes the conntrack entries that were translated by
+this node (reply source differs from the original destination), towards a VIP
+the mode knows (previous or current state), and:
 
-After every successful sync whose programmed backends changed, and once after
-the first sync, the mode deletes the conntrack entries that:
+- **TCP**: whose frontend is gone **on this node** — service removed or no
+  longer managed, port removed, or this node no longer the announcer (MetalLB
+  moved the VIP). A TCP backend withdrawn from a frontend that remains keeps its
+  established connections until they end on their own, or until its pod goes;
+  new connections no longer reach it.
+- **UDP** (and any other protocol): whose backend is no longer programmed nor
+  draining — gone from the EndpointSlices or not ready — or whose frontend is
+  gone. Without the purge an active UDP flow would keep being sent to a backend
+  that left, forever.
 
-- were translated by this node (reply source differs from the original
-  destination), and
-- target a VIP the mode knows (previous or current state), and
-- point to a (VIP, protocol, port, backend IP, backend port) that is no longer
-  programmed **on this node** — backend gone from the EndpointSlices or not
-  ready, port
-  removed, service removed or no longer managed, or this node no longer the
-  announcer.
+Why TCP is left alone: kube-proxy only purges UDP on endpoint removal, and the
+lab showed the cost of doing otherwise. A backend taken out of a Service while
+a request was in flight lost its flow at the purge, and the client, idle while
+waiting for the answer, hung until its own timeout: the backend's reply matched
+no entry any more, and no RST reached the client. Left alone, the request
+completes.
 
-A local endpoint that is terminating is *draining*: it gets no new
-connection, but its live ones are kept until it leaves the slices, so a backend
-shutting down gracefully (an ingress-nginx rolling update) can finish them, as
-behind kube-proxy or Cilium. An endpoint that is merely not ready is not: its
-probe says it cannot serve, so its flows are purged as if it had been removed.
+A local UDP endpoint that is terminating is *draining*: it gets no new flow, but
+its live ones are kept until it leaves the slices. An endpoint that is merely
+not ready is not: its probe says it cannot serve.
 
 Untranslated flows towards a VIP (a pod on a non-announcer node passing through)
 are never touched, nor is anything the VM mode tracks. The purge runs after the
@@ -565,14 +570,11 @@ another tenant, the source IP logged by the backend, MetalLB announcer, and the
     the CCM's UPDATE.
 11. **Where the label lives**: `networking.cozystack.io/lb-proxy: cozy-proxy` is a
     proposal; the maintainers may prefer another key.
-12. **Purging the TCP flows of a backend that is still alive.** On the lab, a
-    backend taken out of the Service (label removed) while a request was in
-    flight lost its flow at the purge, and the client, idle while waiting for
-    the answer, hung until its own timeout: the backend's reply no longer
-    matched any conntrack entry, and no RST reached the client. kube-proxy
-    does not purge TCP flows on endpoint removal; it only does so for UDP.
-    Should the L4 mode purge only UDP, and TCP only when the service, the
-    port or the announcement goes?
+12. **Purging the TCP flows of a backend that is still alive — decided.** Aligned
+    on kube-proxy (4.3): on endpoint removal only UDP flows are purged; TCP flows
+    go with their frontend (service, port, announcement, including a MetalLB
+    failover). Reason: kube-proxy behaves so, and on the lab an idle client of a
+    withdrawn but live backend hung without a RST until its own timeout.
 13. **`google/nftables` limits**: no `typeof` on sets, and no direction on the
     typed conntrack keys (3.1). Both are cosmetic for `nft list` today; fixing
     them upstream would let the masquerade match the original destination.
@@ -613,7 +615,7 @@ VM mode off, next to the platform's cozy-proxy):
 | round-robin between the announcer's two local backends | OK | |
 | undeclared port, ping (tcpdump on the announcer and on another node) | dropped, no packet sent back out | |
 | CIDR deny `0.0.0.0/0 except <client>` on the backend | pods and VM refused, the allowed client passes | |
-| backend withdrawn | its flows purged, new connections go to the others | |
+| backend withdrawn | its flows purged, new connections go to the others (built from `181b41c`; since then TCP flows of a withdrawn backend are kept, see 4.3) | |
 | announcer moved by MetalLB | one failed probe out of ~110 (0.5 s interval) | |
 | rollout restart of the DaemonSet | open connection kept, 0 failed probes out of 113 | |
 | Postgres app, psql from pods, VM and VPN; `pg_stat_activity` | OK | `100.64.0.x`, VM IP, VPN address |

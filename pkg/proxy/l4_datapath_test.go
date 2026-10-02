@@ -274,9 +274,11 @@ func TestL4DatapathDropsPortWithoutBackend(t *testing.T) {
 	}
 }
 
-// After a backend is withdrawn, its existing flows are purged from the
-// announcer's conntrack, and new connections only reach the remaining one.
-func TestL4DatapathPurgesWithdrawnBackend(t *testing.T) {
+// A TCP backend withdrawn from a frontend that remains keeps its flows, as
+// behind kube-proxy, while new connections only reach the remaining backend.
+// The flows go once the frontend goes — here, the node no longer announcing
+// the VIP.
+func TestL4DatapathPurgesTCPFlowsWithTheirFrontend(t *testing.T) {
 	tp := newTopology(t)
 	serve(t, tp.server)
 	dp := datapathIn(tp.router)
@@ -290,32 +292,28 @@ func TestL4DatapathPurgesWithdrawnBackend(t *testing.T) {
 		}
 	}
 
-	gone := netip.AddrPortFrom(a(backendB), backendPort)
-	before := 0
-	for _, f := range listFlows(t, ct.Handle) {
-		if f.ReplySrc == gone {
-			before++
+	withdrawn := netip.AddrPortFrom(a(backendB), backendPort)
+	flowsTo := func(b netip.AddrPort) int {
+		n := 0
+		for _, f := range listFlows(t, ct.Handle) {
+			if f.ReplySrc == b {
+				n++
+			}
 		}
+		return n
 	}
-	if before == 0 {
+	if flowsTo(withdrawn) == 0 {
 		t.Fatal("no flow towards the backend about to be withdrawn: the test would prove nothing")
 	}
 
 	cur := routerState()
 	cur.Rules[0].Backends = []l4.Backend{bk(backendA, backendPort)}
 	must(t, "Sync", dp.Sync(cur))
-	n, err := ct.Purge(l4.StaleFlows(&prev, cur))
-	if err != nil {
-		t.Fatalf("Purge: %v", err)
+	if n, err := ct.Purge(l4.StaleFlows(&prev, cur)); err != nil || n != 0 {
+		t.Fatalf("Purge after a TCP backend withdrawal = %d, %v; want nothing purged", n, err)
 	}
-	if int(n) != before {
-		t.Errorf("Purge deleted %d flows, want the %d towards the withdrawn backend", n, before)
-	}
-
-	for _, f := range listFlows(t, ct.Handle) {
-		if f.ReplySrc == gone {
-			t.Errorf("a flow towards the withdrawn backend survived: %+v", f)
-		}
+	if flowsTo(withdrawn) == 0 {
+		t.Error("the withdrawn TCP backend lost its flows; they must end on their own")
 	}
 	for i := 0; i < 2; i++ {
 		ans, err := dial(t, tp.client, testVIP+":80")
@@ -325,6 +323,20 @@ func TestL4DatapathPurgesWithdrawnBackend(t *testing.T) {
 		if ans.backend != a(backendA) {
 			t.Errorf("connection reached %s, want only %s", ans.backend, backendA)
 		}
+	}
+
+	unannounced := routerState()
+	unannounced.Rules = nil
+	must(t, "Sync", dp.Sync(unannounced))
+	n, err := ct.Purge(l4.StaleFlows(&cur, unannounced))
+	if err != nil {
+		t.Fatalf("Purge: %v", err)
+	}
+	if n == 0 {
+		t.Error("losing the announcement must purge the translated flows")
+	}
+	if left := flowsTo(withdrawn) + flowsTo(netip.AddrPortFrom(a(backendA), backendPort)); left != 0 {
+		t.Errorf("%d translated flows survived the end of the announcement", left)
 	}
 }
 

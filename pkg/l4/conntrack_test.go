@@ -34,15 +34,28 @@ func rule(vip string, port uint16, backends ...Backend) Rule {
 	return Rule{PortKey: key(vip, port), Service: "ns/svc", Backends: backends}
 }
 
+func udpRule(vip string, port uint16, backends ...Backend) Rule {
+	r := rule(vip, port, backends...)
+	r.Protocol = v1.ProtocolUDP
+	return r
+}
+
+// The purge follows kube-proxy: a withdrawn endpoint loses its UDP flows, but
+// its TCP connections are left to end on their own; TCP flows only go with
+// their frontend — the service, the port, or this node's announcement.
 func TestStaleFlows(t *testing.T) {
 	prev := stateWith(
 		rule("192.0.2.10", 80, be("10.0.0.1", 8080), be("10.0.0.2", 8080)),
 		rule("192.0.2.10", 443, be("10.0.0.1", 8443)),
+		udpRule("192.0.2.10", 53, be("10.0.0.1", 5353), be("10.0.0.2", 5353)),
 		rule("192.0.2.20", 5432, be("10.0.0.3", 5432)),
 	)
 	// 10.0.0.2 went away, port 443 was removed from the service, and the
 	// 192.0.2.20 service is gone altogether.
-	cur := stateWith(rule("192.0.2.10", 80, be("10.0.0.1", 8080)))
+	cur := stateWith(
+		rule("192.0.2.10", 80, be("10.0.0.1", 8080)),
+		udpRule("192.0.2.10", 53, be("10.0.0.1", 5353)),
+	)
 
 	stale := StaleFlows(&prev, cur)
 
@@ -52,10 +65,13 @@ func TestStaleFlows(t *testing.T) {
 		want bool
 	}{
 		{"backend still programmed", translated(tcp, "192.0.2.10:80", "10.0.0.1:8080"), false},
-		{"backend gone", translated(tcp, "192.0.2.10:80", "10.0.0.2:8080"), true},
+		// Purging it would leave an idle client hanging without a RST, as
+		// seen on the lab; the connection ends on its own, or with its pod.
+		{"TCP backend gone, frontend kept", translated(tcp, "192.0.2.10:80", "10.0.0.2:8080"), false},
+		{"UDP backend gone", translated(udp, "192.0.2.10:53", "10.0.0.2:5353"), true},
+		{"UDP backend still programmed", translated(udp, "192.0.2.10:53", "10.0.0.1:5353"), false},
 		{"port removed", translated(tcp, "192.0.2.10:443", "10.0.0.1:8443"), true},
 		{"service removed", translated(tcp, "192.0.2.20:5432", "10.0.0.3:5432"), true},
-		{"same backend IP, other port", translated(tcp, "192.0.2.10:80", "10.0.0.1:9090"), true},
 		{"protocol not programmed", translated(udp, "192.0.2.10:80", "10.0.0.1:8080"), true},
 		// A pod on a node that does not announce the VIP goes through
 		// untranslated; its flow is not ours to cut.
@@ -72,8 +88,8 @@ func TestStaleFlows(t *testing.T) {
 }
 
 // After a restart there is no previous state: whatever this node translated
-// towards a VIP it knows and no longer programs must go — for instance after
-// the announcement moved to another node while the pod was down.
+// towards a frontend it no longer programs must go — for instance after the
+// announcement moved to another node while the pod was down.
 func TestStaleFlowsWithoutPreviousState(t *testing.T) {
 	cur := State{
 		VIPs:  []netip.Addr{addr("192.0.2.10")},
@@ -82,6 +98,10 @@ func TestStaleFlowsWithoutPreviousState(t *testing.T) {
 	stale := StaleFlows(nil, cur)
 	if !stale(translated(tcp, "192.0.2.10:80", "10.0.0.1:8080")) {
 		t.Error("a translation this node no longer programs must be purged")
+	}
+	announced := stateWith(rule("192.0.2.10", 80, be("10.0.0.1", 8080)))
+	if StaleFlows(nil, announced)(translated(tcp, "192.0.2.10:80", "10.0.0.9:8080")) {
+		t.Error("a TCP flow to a frontend still programmed must be kept, whatever its backend")
 	}
 	if stale(translated(tcp, "192.0.2.10:80", "192.0.2.10:80")) {
 		t.Error("an untranslated flow must be kept")
@@ -100,7 +120,10 @@ func TestPurgeNeeded(t *testing.T) {
 		{"unchanged", &base, base, false},
 		{"backend added", &base, stateWith(rule("192.0.2.10", 80, be("10.0.0.1", 8080), be("10.0.0.2", 8080))), false},
 		{"service added", &base, stateWith(rule("192.0.2.10", 80, be("10.0.0.1", 8080)), rule("192.0.2.11", 80)), false},
-		{"backend replaced", &base, stateWith(rule("192.0.2.10", 80, be("10.0.0.2", 8080))), true},
+		{"TCP backend replaced", &base, stateWith(rule("192.0.2.10", 80, be("10.0.0.2", 8080))), false},
+		{"UDP backend replaced", ptr(stateWith(udpRule("192.0.2.10", 53, be("10.0.0.1", 5353)))),
+			stateWith(udpRule("192.0.2.10", 53, be("10.0.0.2", 5353))), true},
+		{"port removed", &base, stateWith(rule("192.0.2.10", 81, be("10.0.0.1", 8080))), true},
 		{"no longer announced", &base, State{VIPs: base.VIPs, Ports: base.Ports}, true},
 		{"node IPs only", &base, State{VIPs: base.VIPs, Ports: base.Ports, Rules: base.Rules, NodeIPs: []netip.Addr{addr("10.200.24.11")}}, false},
 	}
@@ -119,24 +142,24 @@ func TestProtocolNumber(t *testing.T) {
 	}
 }
 
-// A terminating backend keeps its live connections until it leaves the
-// EndpointSlice; only then are they purged.
+// A terminating UDP backend keeps its flows until it leaves the EndpointSlice;
+// only then are they purged.
 func TestDrainingBackendKeepsItsFlows(t *testing.T) {
-	ready := stateWith(rule("192.0.2.10", 80, be("10.0.0.1", 8080), be("10.0.0.2", 8080)))
-	draining := stateWith(rule("192.0.2.10", 80, be("10.0.0.1", 8080)))
-	draining.Rules[0].Draining = []Backend{be("10.0.0.2", 8080)}
-	gone := stateWith(rule("192.0.2.10", 80, be("10.0.0.1", 8080)))
+	ready := stateWith(udpRule("192.0.2.10", 53, be("10.0.0.1", 5353), be("10.0.0.2", 5353)))
+	draining := stateWith(udpRule("192.0.2.10", 53, be("10.0.0.1", 5353)))
+	draining.Rules[0].Draining = []Backend{be("10.0.0.2", 5353)}
+	gone := stateWith(udpRule("192.0.2.10", 53, be("10.0.0.1", 5353)))
 
 	if PurgeNeeded(&ready, draining) {
 		t.Error("a backend that starts draining must not trigger a purge")
 	}
-	if StaleFlows(&ready, draining)(translated(tcp, "192.0.2.10:80", "10.0.0.2:8080")) {
+	if StaleFlows(&ready, draining)(translated(udp, "192.0.2.10:53", "10.0.0.2:5353")) {
 		t.Error("a draining backend's flows must be kept")
 	}
 	if !PurgeNeeded(&draining, gone) {
 		t.Error("a draining backend that leaves the slice must trigger a purge")
 	}
-	if !StaleFlows(&draining, gone)(translated(tcp, "192.0.2.10:80", "10.0.0.2:8080")) {
+	if !StaleFlows(&draining, gone)(translated(udp, "192.0.2.10:53", "10.0.0.2:5353")) {
 		t.Error("the flows of a backend gone from the slice must be purged")
 	}
 }
