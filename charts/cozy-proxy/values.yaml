@@ -10,3 +10,10 @@ daemonset:
 
 rbac:
   create: true
+
+# L4 LoadBalancer mode: takes over from Cilium the public IP of services
+# labelled networking.cozystack.io/lb-proxy=cozy-proxy that also carry
+# service.cilium.io/type=ClusterIP. See docs/rfc/l4-loadbalancer-mode.md.
+# Disabling it removes the table it programmed on the next start.
+l4LoadBalancer:
+  enabled: false
