@@ -383,9 +383,20 @@ Consequences:
   distinction must use ClusterIP and network policies, or mTLS.
 - **ingress-nginx `whitelist-source-range`, Postgres `pg_hba`** and similar
   application-level allowlists see the same addresses as the network policies.
-- **Annotation trust**: see 2.5. A tenant copying `service.cilium.io/type` onto
-  its infra Service through the CCM only makes its own LB dark: without the
-  label, cozy-proxy does not pick it up.
+- **A tenant cannot switch its own LB to the L4 mode.** The kubevirt CCM
+  copies every annotation of the tenant Service onto the infra Service, so a
+  tenant controls `service.cilium.io/type` there — but not the labels: the CCM
+  sets only its own (`cluster.x-k8s.io/tenant-service-*`, `cluster-name`) and the
+  platform's `infraLabels`. cozy-proxy requires the
+  `networking.cozystack.io/lb-proxy` label (2.5), so the annotation alone never
+  makes it program anything. At worst a tenant copying `service.cilium.io/type:
+  ClusterIP` makes its own LB dark (Cilium lets go, nobody takes over); the
+  Kyverno guard of 7.1 refuses such a Service in the first place.
+- **What the tenant still controls on an L4 CCM Service**: the ports (the CCM
+  copies them) and `externalTrafficPolicy`. A tenant Service in eTP `Cluster`
+  that the platform labelled anyway would be refused by cozy-proxy and stay
+  dark, which is why the label and the annotation must be set per Service, for
+  eTP `Local` only (7).
 
 ## 6. `externalTrafficPolicy`
 
@@ -408,9 +419,69 @@ enabled per environment.
 |---|---|---|
 | Postgres | `packages/apps/postgres/templates/external-svc.yaml` | add the label and the annotation; eTP is already `Local` |
 | MariaDB | `packages/apps/mariadb/templates/mariadb.yaml` (`spec.service` / `spec.primaryService`) | add the label and the annotation through the operator's service template, and set `externalTrafficPolicy: Local` (operator default is `Cluster`) |
-| Tenant Kubernetes (CCM) | `packages/apps/kubernetes/templates/cloud-config.yaml` | label through `infraLabels`, which the CCM already supports. The annotation needs a CCM patch (`infraAnnotations`, next to the existing patches in `packages/apps/kubernetes/images/kubevirt-cloud-provider/patches`). The CCM only sets labels and annotations at creation, so existing infra Services need a one-shot patch. Only tenant Services with eTP `Local` are eligible in phase 1. |
+| Tenant Kubernetes (CCM) | CCM patch, next to the existing ones in `packages/apps/kubernetes/images/kubevirt-cloud-provider/patches`, switched on from `packages/apps/kubernetes/templates/cloud-config.yaml` | The CCM itself sets the label and `service.cilium.io/type: ClusterIP`, overriding any value copied from the tenant, and only when the tenant Service is eTP `Local`. `infraLabels` alone is not enough: it labels every Service of the cluster, eTP `Cluster` ones included, and the annotation would still have to come from the tenant. The CCM only sets labels and annotations at creation, so existing infra Services need a one-shot patch. See 7.1 for the Kyverno guard. |
 | Ingress | `packages/extra/ingress/templates/nginx-ingress.yaml` | `controller.service.labels` / `annotations`; eTP is already `Local`. The host ingress (`tenant-root`) with PROXY protocol and ouroboros is last, see Open questions. |
 | cozy-proxy | `packages/system/cozy-proxy` | bump the vendored chart, enable the mode, extend RBAC (EndpointSlices, Nodes, ServiceL2Status) |
+
+### 7.1 Coexistence with the Kyverno guard on CCM Services
+
+The policy `ccm-lb-tenant-fields-guard` (hikube-gitops !121, `Audit` when
+proposed) refuses, on CREATE and UPDATE, any Service carrying
+`cluster.x-k8s.io/tenant-service-name` that has `spec.externalIPs` or one of a
+list of MetalLB, external-dns and Cilium annotations, `service.cilium.io/type`
+included: a tenant must not drive them through the CCM's copy. As proposed, it
+would refuse every L4 CCM Service — at creation, and on every later UPDATE, the
+CCM's own port updates and the one-shot migration patch included.
+
+The two are reconciled by narrowing that one key rather than dropping it:
+
+1. `service.cilium.io/type` leaves the guard's generic deny list, and gets a
+   rule of its own: it is allowed only with the value `ClusterIP` **and** on a
+   Service that also carries `networking.cozystack.io/lb-proxy: cozy-proxy`.
+   Every other `service.cilium.io/*` key stays refused.
+2. The label is set by the platform only (the CCM patch or the migration
+   patch); the CCM copies no tenant label, so a tenant cannot satisfy the
+   exception by itself.
+3. The annotation is set by the CCM patch, overriding the tenant's value, rather
+   than copied from the tenant. A tenant copying `ClusterIP` onto a Service the
+   platform did not label is still refused.
+
+A sketch of the dedicated rule (to be validated against the Kyverno version in
+use, 1.18.2 when written):
+
+```yaml
+- name: cilium-type-only-for-l4
+  match:
+    any:
+      - resources:
+          kinds: ["Service"]
+          operations: ["CREATE", "UPDATE"]
+          selector:
+            matchExpressions:
+              - {key: cluster.x-k8s.io/tenant-service-name, operator: Exists}
+  preconditions:
+    all:
+      - key: "{{ request.object.metadata.annotations.\"service.cilium.io/type\" || '' }}"
+        operator: NotEquals
+        value: ""
+  validate:
+    message: >-
+      service.cilium.io/type is only allowed as ClusterIP on a LoadBalancer the
+      platform handed to cozy-proxy (label networking.cozystack.io/lb-proxy).
+    deny:
+      conditions:
+        any:
+          - key: "{{ request.object.metadata.annotations.\"service.cilium.io/type\" }}"
+            operator: NotEquals
+            value: ClusterIP
+          - key: "{{ request.object.metadata.labels.\"networking.cozystack.io/lb-proxy\" || '' }}"
+            operator: NotEquals
+            value: cozy-proxy
+```
+
+Order of the rollout: the narrowed policy goes in before the first CCM Service
+is migrated, otherwise the migration patch is refused once the policy is
+enforced, and reported as a violation while it is in `Audit`.
 
 ## 8. Migration and rollback, per service
 
@@ -431,6 +502,11 @@ ignores it): the runbook must always remove the annotation.
 
 Whole mode: remove every annotation, then disable the mode (which deletes the
 table).
+
+For a CCM Service, the label and the annotation are both put on the infra
+Service by the platform (7, 7.1), never through the tenant Service; the rollback
+removes the annotation there, and the CCM patch must not put it back on its next
+update.
 
 ## 9. Rollout plan
 
@@ -484,9 +560,12 @@ another tenant, the source IP logged by the backend, MetalLB announcer, and the
 9. **Observability**: metrics (sync duration and errors, programmed services,
    purged flows) and Events on the Service when it is refused. Phase 1 only
    logs, once per change.
-10. **Where the label lives**: `networking.cozystack.io/lb-proxy: cozy-proxy` is a
+10. **Kyverno guard (7.1)**: the narrowed rule is a sketch; it has to be agreed
+    with the owners of hikube-gitops !121 and tested on the lab, on CREATE and on
+    the CCM's UPDATE.
+11. **Where the label lives**: `networking.cozystack.io/lb-proxy: cozy-proxy` is a
     proposal; the maintainers may prefer another key.
-11. **`google/nftables` limits**: no `typeof` on sets, and no direction on the
+12. **`google/nftables` limits**: no `typeof` on sets, and no direction on the
     typed conntrack keys (3.1). Both are cosmetic for `nft list` today; fixing
     them upstream would let the masquerade match the original destination.
 
