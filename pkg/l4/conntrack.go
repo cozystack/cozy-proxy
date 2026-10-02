@@ -25,11 +25,16 @@ type target struct {
 	backend  netip.AddrPort
 }
 
+// targets returns the translations whose flows must be kept: the ones the
+// datapath performs, and the ones towards draining backends, which finish
+// their connections.
 func targets(st State) map[target]struct{} {
 	out := map[target]struct{}{}
 	for _, r := range st.Rules {
-		for _, b := range r.Backends {
-			out[target{r.VIP, protocolNumber(r.Protocol), r.Port, netip.AddrPortFrom(b.IP, b.Port)}] = struct{}{}
+		for _, bs := range [][]Backend{r.Backends, r.Draining} {
+			for _, b := range bs {
+				out[target{r.VIP, protocolNumber(r.Protocol), r.Port, netip.AddrPortFrom(b.IP, b.Port)}] = struct{}{}
+			}
 		}
 	}
 	return out
@@ -44,7 +49,7 @@ func targets(st State) map[target]struct{} {
 //
 // An entry is stale when this node translated it (its replies do not come from
 // the address the client used), towards a VIP the L4 mode knows, and to a
-// target the node no longer programs. Untranslated flows to a VIP — a pod on a
+// target the node no longer programs nor drains. Untranslated flows to a VIP — a pod on a
 // node that does not announce it, passing through — are left alone, and so is
 // everything addressed elsewhere, which keeps the VM mode out of reach.
 func StaleFlows(prev *State, cur State) func(Flow) bool {

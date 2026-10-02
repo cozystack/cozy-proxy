@@ -35,6 +35,11 @@ type Rule struct {
 	// Service is the namespace/name of the Service the frontend belongs to.
 	Service  string
 	Backends []Backend
+	// Draining are local endpoints still listed but not ready, or
+	// terminating. They get no new connection, but their live ones are not
+	// purged: a backend shutting down gracefully must be able to finish them,
+	// as it would behind kube-proxy or Cilium. The datapath ignores them.
+	Draining []Backend
 }
 
 // State is everything one node programs for the L4 mode. Every slice is sorted,
@@ -138,9 +143,9 @@ func (b *builder) addService(svc *v1.Service) {
 			b.notice(key, "port %s/%d not programmed: only TCP is supported", proto, sp.Port)
 			continue
 		}
-		var backends []Backend
+		var backends, draining []Backend
 		if announced {
-			backends = b.localBackends(key, svc.Namespace, svc.Name, sp.Name, proto)
+			backends, draining = b.localBackends(key, svc.Namespace, svc.Name, sp.Name, proto)
 		}
 		for _, vip := range vips {
 			pk := PortKey{VIP: vip, Protocol: proto, Port: uint16(sp.Port)}
@@ -151,17 +156,17 @@ func (b *builder) addService(svc *v1.Service) {
 			b.owner[pk] = key
 			b.st.Ports = append(b.st.Ports, pk)
 			if announced {
-				b.st.Rules = append(b.st.Rules, Rule{PortKey: pk, Service: key, Backends: backends})
+				b.st.Rules = append(b.st.Rules, Rule{PortKey: pk, Service: key, Backends: backends, Draining: draining})
 			}
 		}
 	}
 }
 
-// localBackends returns the ready endpoints of the service port hosted on this
-// node, sorted and deduplicated. The port is matched by name and protocol, the
-// way kube-proxy does, which also resolves named target ports.
-func (b *builder) localBackends(key, ns, name, portName string, proto v1.Protocol) []Backend {
-	var out []Backend
+// localBackends returns the endpoints of the service port hosted on this node,
+// sorted and deduplicated: the ones serving, and the draining ones. The port
+// is matched by name and protocol, the way kube-proxy does, which also
+// resolves named target ports.
+func (b *builder) localBackends(key, ns, name, portName string, proto v1.Protocol) (ready, draining []Backend) {
 	for _, s := range b.slices[ns+"/"+name] {
 		if s.AddressType != discoveryv1.AddressTypeIPv4 {
 			continue
@@ -171,7 +176,7 @@ func (b *builder) localBackends(key, ns, name, portName string, proto v1.Protoco
 			continue
 		}
 		for _, ep := range s.Endpoints {
-			if !ready(ep) || ep.NodeName == nil || *ep.NodeName != b.in.NodeName || len(ep.Addresses) == 0 {
+			if ep.NodeName == nil || *ep.NodeName != b.in.NodeName || len(ep.Addresses) == 0 {
 				continue
 			}
 			ip, err := netip.ParseAddr(ep.Addresses[0])
@@ -182,12 +187,27 @@ func (b *builder) localBackends(key, ns, name, portName string, proto v1.Protoco
 				b.notice(key, "backend %s excluded: it is the pod of VM-mode service %s", ip, owner)
 				continue
 			}
-			out = append(out, Backend{IP: ip, Port: port})
+			if serves(ep) {
+				ready = append(ready, Backend{IP: ip, Port: port})
+			} else {
+				draining = append(draining, Backend{IP: ip, Port: port})
+			}
 		}
 	}
-	return sortedUnique(out, func(x, y Backend) int {
-		return cmp.Or(x.IP.Compare(y.IP), cmp.Compare(x.Port, y.Port))
+	ready = sortedUnique(ready, compareBackend)
+	// An endpoint listed both ways during a transition counts as serving.
+	draining = slices.DeleteFunc(sortedUnique(draining, compareBackend), func(d Backend) bool {
+		_, found := slices.BinarySearchFunc(ready, d, compareBackend)
+		return found
 	})
+	if len(draining) == 0 {
+		draining = nil
+	}
+	return ready, draining
+}
+
+func compareBackend(x, y Backend) int {
+	return cmp.Or(x.IP.Compare(y.IP), cmp.Compare(x.Port, y.Port))
 }
 
 // vmModePods returns the pod IPs backing a VM-mode service. The VM mode
@@ -212,9 +232,14 @@ func (b *builder) vmModePods() map[netip.Addr]string {
 	return out
 }
 
-// ready follows the EndpointSlice API: a nil Ready is to be read as ready.
-// A terminating endpoint is not ready.
-func ready(ep discoveryv1.Endpoint) bool {
+// serves reports whether an endpoint may take new connections. A nil Ready is
+// to be read as ready, per the EndpointSlice API. A terminating endpoint does
+// not serve even when Ready says true, which publishNotReadyAddresses makes it
+// do.
+func serves(ep discoveryv1.Endpoint) bool {
+	if ep.Conditions.Terminating != nil && *ep.Conditions.Terminating {
+		return false
+	}
 	return ep.Conditions.Ready == nil || *ep.Conditions.Ready
 }
 

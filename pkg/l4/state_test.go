@@ -103,9 +103,11 @@ func TestBuildAnnouncedServiceUsesLocalReadyBackends(t *testing.T) {
 		Ports: []PortKey{key("192.0.2.10", 80), key("192.0.2.10", 443)},
 		Rules: []Rule{
 			{PortKey: key("192.0.2.10", 80), Service: "ns/pg",
-				Backends: []Backend{be("10.0.0.1", 8080), be("10.0.0.2", 8080), be("10.0.0.6", 8080)}},
+				Backends: []Backend{be("10.0.0.1", 8080), be("10.0.0.2", 8080), be("10.0.0.6", 8080)},
+				Draining: []Backend{be("10.0.0.4", 8080), be("10.0.0.5", 8080)}},
 			{PortKey: key("192.0.2.10", 443), Service: "ns/pg",
-				Backends: []Backend{be("10.0.0.1", 8443), be("10.0.0.2", 8443), be("10.0.0.6", 8443)}},
+				Backends: []Backend{be("10.0.0.1", 8443), be("10.0.0.2", 8443), be("10.0.0.6", 8443)},
+				Draining: []Backend{be("10.0.0.4", 8443), be("10.0.0.5", 8443)}},
 		},
 	}
 	if !reflect.DeepEqual(got, want) {
@@ -417,4 +419,39 @@ func hasNotice(notices []Notice, service, substr string) bool {
 		}
 	}
 	return false
+}
+
+// A local endpoint that is still listed but not ready, or terminating, gets no
+// new connection. It is kept as draining, so its live connections are not
+// purged: a rolling update of an Ingress must not reset every client.
+func TestBuildKeepsNotReadyLocalEndpointsAsDraining(t *testing.T) {
+	svc := l4Service("ns", "web", "192.0.2.10")
+	svc.Spec.Ports = []v1.ServicePort{svcPort("http", 80)}
+
+	notReady := endpoint("10.0.0.2", thisNode)
+	notReady.Conditions.Ready = ptr(false)
+	// publishNotReadyAddresses keeps Ready true on a terminating endpoint.
+	terminating := endpoint("10.0.0.3", thisNode)
+	terminating.Conditions.Terminating = ptr(true)
+	remote := endpoint("10.0.0.4", "node-b")
+	remote.Conditions.Ready = ptr(false)
+
+	got, _ := Build(Input{
+		NodeName: thisNode,
+		Services: []*v1.Service{svc},
+		EndpointSlices: []*discoveryv1.EndpointSlice{slice("ns", "web", "web-1",
+			[]discoveryv1.EndpointPort{epPort("http", 8080)},
+			endpoint("10.0.0.1", thisNode), notReady, terminating, remote)},
+		Announced: map[string]bool{"ns/web": true},
+	})
+
+	want := []Rule{{
+		PortKey:  key("192.0.2.10", 80),
+		Service:  "ns/web",
+		Backends: []Backend{be("10.0.0.1", 8080)},
+		Draining: []Backend{be("10.0.0.2", 8080), be("10.0.0.3", 8080)},
+	}}
+	if !reflect.DeepEqual(got.Rules, want) {
+		t.Errorf("Rules = %+v, want %+v", got.Rules, want)
+	}
 }
