@@ -101,8 +101,13 @@ type builder struct {
 	notices []Notice
 }
 
+// notice records a message once, however many ports or slices raise it.
 func (b *builder) notice(service, format string, args ...any) {
-	b.notices = append(b.notices, Notice{Service: service, Message: fmt.Sprintf(format, args...)})
+	n := Notice{Service: service, Message: fmt.Sprintf(format, args...)}
+	if slices.Contains(b.notices, n) {
+		return
+	}
+	b.notices = append(b.notices, n)
 }
 
 func (b *builder) addService(svc *v1.Service) {

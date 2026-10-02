@@ -348,8 +348,8 @@ func TestBuildExcludesBackendsOwnedByTheVMMode(t *testing.T) {
 	vm.Labels[vmProxyNameLabel] = vmProxyName
 
 	web := l4Service("tenant", "web", "192.0.2.10")
-	web.Spec.Ports = []v1.ServicePort{svcPort("http", 80)}
-	ports := []discoveryv1.EndpointPort{epPort("http", 8080)}
+	web.Spec.Ports = []v1.ServicePort{svcPort("http", 80), svcPort("https", 443)}
+	ports := []discoveryv1.EndpointPort{epPort("http", 8080), epPort("https", 8443)}
 
 	got, notices := Build(Input{
 		NodeName: thisNode,
@@ -362,11 +362,15 @@ func TestBuildExcludesBackendsOwnedByTheVMMode(t *testing.T) {
 	})
 
 	want := []Backend{be("10.0.0.8", 8080)}
-	if len(got.Rules) != 1 || !reflect.DeepEqual(got.Rules[0].Backends, want) {
-		t.Errorf("Rules = %+v, want only %v", got.Rules, want)
+	if len(got.Rules) != 2 || !reflect.DeepEqual(got.Rules[0].Backends, want) {
+		t.Errorf("Rules = %+v, want only %v on port 80", got.Rules, want)
 	}
 	if !hasNotice(notices, "tenant/web", "10.0.0.7") {
 		t.Errorf("an excluded backend must be reported, got %v", notices)
+	}
+	// Once, although both ports raise it.
+	if len(notices) != 1 {
+		t.Errorf("notices = %v, want a single one", notices)
 	}
 }
 
