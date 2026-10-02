@@ -108,7 +108,7 @@ func (d *NFTL4Datapath) Teardown() error {
 //	chain guard  filter prerouting mangle+10
 //	  ct state established,related accept
 //	  ip daddr @vips ip daddr . meta l4proto . th dport != @vip_ports drop
-//	chain dnat   nat prerouting dstnat-5      (rules on the announcer only)
+//	chain translate  nat prerouting dstnat-5  (rules on the announcer only)
 //	  ip daddr V tcp dport P dnat ip addr . port to numgen inc mod N map @backends-...
 //	  ip daddr V tcp dport P drop             (announced port with no local backend)
 //	chain masq   nat postrouting srcnat-5
@@ -188,8 +188,10 @@ func buildL4Table(conn *nftables.Conn, t *nftables.Table, st l4.State) error {
 		&expr.Verdict{Kind: expr.VerdictDrop},
 	}})
 
-	dnat := conn.AddChain(&nftables.Chain{
-		Name:     "dnat",
+	// Not "dnat": nft takes that for its keyword, and an operator could not
+	// name the chain on the command line without quoting it.
+	translate := conn.AddChain(&nftables.Chain{
+		Name:     "translate",
 		Table:    t,
 		Type:     nftables.ChainTypeNAT,
 		Hooknum:  nftables.ChainHookPrerouting,
@@ -222,7 +224,7 @@ func buildL4Table(conn *nftables.Conn, t *nftables.Table, st l4.State) error {
 		}
 		conn.AddRule(&nftables.Rule{
 			Table:    t,
-			Chain:    dnat,
+			Chain:    translate,
 			Exprs:    exprs,
 			UserData: userdata.AppendString(nil, userdata.TypeComment, r.Service),
 		})

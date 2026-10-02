@@ -200,7 +200,7 @@ table ip cozy_proxy_l4 {
 		ip daddr @vips ip daddr . meta l4proto . th dport != @vip_ports drop
 	}
 
-	chain dnat {
+	chain translate {
 		type nat hook prerouting priority dstnat - 5; policy accept;
 		# announcer only, one rule per (VIP, port)
 		ip daddr <VIP> tcp dport <port> dnat ip addr . port to numgen inc mod <n> map @backends-<ns>/<svc>/tcp/<port>
@@ -221,7 +221,7 @@ Notes:
   ICMP errors about a translated flow (PMTU) still reach the NAT and are
   translated with it. New packets to a VIP on an undeclared (VIP, protocol,
   port) are dropped, which includes ICMP echo: nobody would answer it anyway.
-- `dnat` only holds rules on the announcer. Elsewhere the packet is left alone
+- `translate` only holds rules on the announcer. Elsewhere the packet is left alone
   and routed out, to the announcer.
 - `masq` only matches flows this node translated (`ct status dnat`) towards one
   of its L4 targets, from a node IP, so a node process talking to a backend pod
@@ -246,7 +246,7 @@ Notes:
 | -200 | prerouting | | conntrack | flow lookup / creation |
 | -150 (mangle) | prerouting | `cozy_proxy` | `ingress_dnat` | VM mode: stateless destination rewrite VM VIP -> pod IP |
 | -140 | prerouting | `cozy_proxy_l4` | `guard` | L4: drop undeclared traffic to L4 VIPs |
-| -105 | prerouting | `cozy_proxy_l4` | `dnat` | L4: stateful DNAT, first packet only |
+| -105 | prerouting | `cozy_proxy_l4` | `translate` | L4: stateful DNAT, first packet only |
 | -100 | prerouting | | kube-ovn / iptables nat | unchanged |
 | 0 (filter) | prerouting | `cozy_proxy` | `port_filter` | VM mode: per-port filter on VM pod IPs |
 | 95 | postrouting | `cozy_proxy_l4` | `masq` | L4: masquerade node sources |

@@ -46,7 +46,7 @@ table ip cozy_proxy_l4 {
 		ip daddr @vips ip daddr . meta l4proto . th dport != @vip_ports drop
 	}
 
-	chain dnat {
+	chain translate {
 		type nat hook prerouting priority dstnat - 5; policy accept;
 		ip daddr 192.0.2.10 tcp dport 80 dnat ip to numgen inc mod 2 map @backends-192.0.2.10-tcp-80 comment "tenant-a/ingress"
 		ip daddr 192.0.2.10 tcp dport 443 dnat ip to numgen inc mod 2 map @backends-192.0.2.10-tcp-443 comment "tenant-a/ingress"

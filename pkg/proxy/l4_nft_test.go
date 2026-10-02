@@ -231,3 +231,30 @@ func TestL4TeardownLeavesOtherTablesAlone(t *testing.T) {
 		t.Errorf("tables after Teardown = %v, want only cozy_proxy", names)
 	}
 }
+
+// Operators inspect one chain at a time. A chain named after an nft keyword
+// ("dnat") cannot be named on the command line without quoting, which is how
+// this was found on the lab.
+func TestL4ChainsCanBeListedByName(t *testing.T) {
+	ns := scratchNetns(t)
+	if err := datapathIn(ns).Sync(announcerState); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	conn, err := nftables.New(nftables.WithNetNSFd(int(ns)))
+	if err != nil {
+		t.Fatalf("nftables.New: %v", err)
+	}
+	chains, err := conn.ListChainsOfTableFamily(nftables.TableFamilyIPv4)
+	if err != nil {
+		t.Fatalf("ListChains: %v", err)
+	}
+	nft := nftBinary(t)
+	for _, ch := range chains {
+		if ch.Table.Name != L4TableName {
+			continue
+		}
+		if out, err := inNetns(t, ns, nft, "list", "chain", "ip", L4TableName, ch.Name); err != nil {
+			t.Errorf("nft list chain %s: %v\n%s", ch.Name, err, out)
+		}
+	}
+}

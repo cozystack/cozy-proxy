@@ -21,7 +21,7 @@ table ip cozy_proxy_l4 {
 		ip daddr @vips ip daddr . meta l4proto . th dport != @vip_ports drop
 	}
 
-	chain dnat {
+	chain translate {
 		type nat hook prerouting priority dstnat - 5; policy accept;
 	}
 
