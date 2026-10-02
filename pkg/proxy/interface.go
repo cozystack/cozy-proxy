@@ -1,6 +1,10 @@
 package proxy
 
-import corev1 "k8s.io/api/core/v1"
+import (
+	corev1 "k8s.io/api/core/v1"
+
+	"github.com/cozystack/cozy-proxy/pkg/l4"
+)
 
 type ProxyProcessor interface {
 	InitRules() error
@@ -75,4 +79,14 @@ type ProxyProcessor interface {
 type PortFilterEntry struct {
 	PodIP string
 	Ports []corev1.ServicePort
+}
+
+// L4Datapath programs the L4 LoadBalancer mode. It is independent of
+// ProxyProcessor, which drives the VM mode, and never touches its state.
+type L4Datapath interface {
+	// Sync replaces everything the L4 mode programs with st, atomically.
+	Sync(st l4.State) error
+
+	// Teardown removes everything the L4 mode programs. No-op if absent.
+	Teardown() error
 }
