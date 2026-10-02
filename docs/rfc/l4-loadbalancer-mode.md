@@ -210,7 +210,7 @@ table ip cozy_proxy_l4 {
 
 	chain masq {
 		type nat hook postrouting priority srcnat - 5; policy accept;
-		ct status dnat ip saddr @node_ips ip daddr . meta l4proto . th dport @backends masquerade
+		ct status dnat ip saddr @node_ips ip daddr . meta l4proto . th dport @backends masquerade fully-random
 	}
 }
 ```
@@ -587,7 +587,30 @@ another tenant, the source IP logged by the backend, MetalLB announcer, and the
     go with their frontend (service, port, announcement, including a MetalLB
     failover). Reason: kube-proxy behaves so, and on the lab an idle client of a
     withdrawn but live backend hung without a RST until its own timeout.
-13. **`google/nftables` limits**: no `typeof` on sets, and no direction on the
+13. **Source-port reuse after masquerading node sources (fully-random).**
+    Measured on the lab: 300 connections per second without keep-alive, for
+    two minutes, from a pod to a CCM ingress in L4 mode. No error, but 0.06 to
+    0.1 % of the connections took over a second, none under Cilium. On the
+    announcer, the backend VM's SYN-ACK left its veth and never reached `ovn0`:
+    it was dropped in OVS/OVN, and the client retransmitted. The tuples hit were
+    `100.64.0.x:<port>`, reused 29 to 50 s after a previous connection on the
+    same port.
+    Cause, as far as the code goes: without a flag, the kernel's masquerade
+    keeps the client's source port whenever *its own* conntrack has the tuple
+    free (`nf_nat_l4proto_unique_tuple`), and it cannot see OVS's conntrack,
+    which may still hold the previous connection. Every client of a node
+    collapses onto one masqueraded address, so the source node's port choices
+    turn into tuple reuse on the announcer. The suspected drop is the
+    `ct.inv` match of the kube-ovn ACLs; that part is not confirmed.
+    Fix in the prototype: `masquerade fully-random`
+    (`NF_NAT_RANGE_PROTO_RANDOM_FULLY`, a fresh random port per flow;
+    `random` alone only offsets from a hash). This breaks the correlation with
+    the source node's choices, but a random port can still land on a tuple OVS
+    tracks: the residual rate grows with the connection rate and with how long
+    OVS keeps closed entries. To be measured again under the same load; if it
+    persists, the next levers are on the OVN side (its conntrack timeouts or
+    ACLs) or more masquerade addresses per announcer.
+14. **`google/nftables` limits**: no `typeof` on sets, and no direction on the
     typed conntrack keys (3.1). Both are cosmetic for `nft list` today; fixing
     them upstream would let the masquerade match the original destination.
 
