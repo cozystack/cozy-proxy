@@ -10,3 +10,21 @@ daemonset:
 
 rbac:
   create: true
+
+# L4 LoadBalancer mode: takes over from Cilium the public IP of services
+# labelled networking.cozystack.io/lb-proxy=cozy-proxy that also carry
+# service.cilium.io/type=ClusterIP. See docs/rfc/l4-loadbalancer-mode.md.
+l4LoadBalancer:
+  enabled: false
+  # With the mode disabled, remove the table an earlier run programmed on the
+  # next start: this is how the mode is rolled back. Set it to false on a
+  # release that runs next to a second release running the L4 mode, or each of
+  # its starts deletes that release's table.
+  removeTableWhenDisabled: true
+
+# VM mode, for services labelled service.kubernetes.io/service-proxy-name=cozy-proxy.
+# Turn it off only to run the L4 mode as a second release next to a cozy-proxy
+# that keeps the VM mode, for instance to try the L4 mode on a live cluster.
+# That cozy-proxy then needs l4LoadBalancer.removeTableWhenDisabled=false.
+vmMode:
+  enabled: true

@@ -9,4 +9,15 @@ rules:
   - apiGroups: [""]
     resources: ["services", "endpoints"]
     verbs: ["get", "list", "watch"]
+  {{- if .Values.l4LoadBalancer.enabled }}
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["list", "watch"]
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["list", "watch"]
+  - apiGroups: ["metallb.io"]
+    resources: ["servicel2statuses"]
+    verbs: ["list", "watch"]
+  {{- end }}
 {{- end }}
