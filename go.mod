@@ -4,6 +4,7 @@ go 1.26.4
 
 require (
 	github.com/google/nftables v0.3.0
+	github.com/vishvananda/netns v0.0.5
 	golang.org/x/sys v0.46.0
 	k8s.io/api v0.36.2
 	k8s.io/apimachinery v0.36.2

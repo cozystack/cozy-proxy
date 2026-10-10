@@ -13,18 +13,28 @@ func (d *DummyProxyProcessor) InitRules() error {
 	return nil
 }
 
-func (d *DummyProxyProcessor) EnsureRules(SvcIP, PodIP string) error {
-	fmt.Printf("EnsureRules called with SvcIP: %s, PodIP: %s\n", SvcIP, PodIP)
+func (d *DummyProxyProcessor) EnsureEgressSNAT(SvcIP, PodIP string) error {
+	fmt.Printf("EnsureEgressSNAT called with SvcIP: %s, PodIP: %s\n", SvcIP, PodIP)
 	return nil
 }
 
-func (d *DummyProxyProcessor) DeleteRules(SvcIP, PodIP string) error {
-	fmt.Printf("DeleteRules called with SvcIP: %s, PodIP: %s\n", SvcIP, PodIP)
+func (d *DummyProxyProcessor) DeleteEgressSNAT(SvcIP, PodIP string) error {
+	fmt.Printf("DeleteEgressSNAT called with SvcIP: %s, PodIP: %s\n", SvcIP, PodIP)
 	return nil
 }
 
-func (d *DummyProxyProcessor) CleanupRules(KeepMap map[string]string) error {
-	fmt.Println("CleanupRules called with KeepMap:", KeepMap)
+func (d *DummyProxyProcessor) EnsureIngressDNAT(SvcIP, PodIP string) error {
+	fmt.Printf("EnsureIngressDNAT called with SvcIP: %s, PodIP: %s\n", SvcIP, PodIP)
+	return nil
+}
+
+func (d *DummyProxyProcessor) DeleteIngressDNAT(SvcIP, PodIP string) error {
+	fmt.Printf("DeleteIngressDNAT called with SvcIP: %s, PodIP: %s\n", SvcIP, PodIP)
+	return nil
+}
+
+func (d *DummyProxyProcessor) CleanupRules(keepEgress, keepIngress map[string]string) error {
+	fmt.Printf("CleanupRules called with keepEgress: %v, keepIngress: %v\n", keepEgress, keepIngress)
 	return nil
 }
 

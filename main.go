@@ -68,9 +68,20 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Datapath rules are programmed only for backend pods hosted on this node.
+	// When NODE_NAME is absent the check is disabled and every service is
+	// programmed, which is the pre-node-local behavior: degraded, but it keeps
+	// a new binary working under a chart that does not inject the variable yet.
+	nodeName := os.Getenv("NODE_NAME")
+	if nodeName == "" {
+		log.Info("NODE_NAME is not set, falling back to programming rules for every node's backends; " +
+			"set it from spec.nodeName to scope rules to this node")
+	}
+
 	controller := &controllers.ServicesController{
 		Clientset: clientset,
 		Proxy:     &proxy.NFTProxyProcessor{},
+		NodeName:  nodeName,
 	}
 
 	if err := mgr.Add(controller); err != nil {
